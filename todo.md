@@ -1,3 +1,53 @@
+# 재시작할 때 먼저 읽기 (2026-08-14 종료 시점)
+
+컴퓨터를 껐다 켠 뒤 이어서 하는 순서. **자산은 전부 `data/`에 보존돼 있다.**
+
+## 상태 한 줄
+
+soma-retargeter를 PR#3으로 올려 K1 교사의 왼다리 결함을 고쳤고, K1 실데이터 재라벨링은
+끝났다(병리 26% → **6.6%**). 합성 라벨링만 11/24에서 멈춰 있다.
+
+## 바로 할 것
+
+1. **합성 라벨링 이어서** — 부분결과를 tmp로 되돌린 뒤 재실행하면 11클립은 건너뛴다
+   ```
+   TMP=<이 세션의 작업 tmp>            # 새 잡이면 아무 쓰기 가능한 경로면 된다
+   cp data/big4_g1.npz.perception.npz data/synth.perception.npz $TMP/
+   cp data/partial_teacher_k1/*.npy $TMP/
+   GEM-X/.venv/bin/python make_labels.py x --out $TMP/synth_k1.npz --robot k1 \
+       --mid $TMP/synth.perception.npz --teacher      # 남은 13클립 ~15분
+   cp $TMP/synth_k1.npz data/
+   ```
+
+2. **K1 기준선 재측정** (아래 2번 항목) — 합성을 기다릴 필요 없이 지금 바로 가능
+   ```
+   .venv-ik/bin/python distill.py data/big4_k1.npz --features pose --width 1024 \
+       --model models/k1_retarget_mlp.pt
+   .venv-ik/bin/python make_offsets.py data/big4_k1.npz
+   ```
+
+## 보존된 자산
+
+| | |
+|---|---|
+| `data/big4_g1.npz.perception.npz` | 실영상 인지 9,396프레임 — **가장 비싸고 재현 불가** |
+| `data/big4_k1.npz` | **새 K1 교사 라벨** (병리 6.6%) |
+| `data/synth.perception.npz` | 합성 14,400프레임 |
+| `data/partial_teacher_k1/` | 부분결과 26개 (실 15 + 합성 11) |
+| `data/big4_g1.npz`, `synth_g1.npz` | G1 라벨 (참고용) |
+| `models/g1_*.pt` | G1 모델 (참고용) |
+| `fixtures/g1_joint_offsets.npz` | G1 오프셋. **K1 오프셋은 없다** — 재생성 필요 |
+
+## 주의
+
+- `fixtures/k1_joint_offsets.npz`가 없어 `ik_server.py --robot k1`은 오프셋 0으로 돈다.
+  잘못된 오프셋보다 낫지만, 재측정 후 `make_offsets.py`로 만들 것
+- `models/k1_retarget_mlp.pt`도 없다(오염 라벨 기반이라 삭제). 2번 실행 시 생성됨
+- 인지는 재현 불가능하다(SAM 워커가 백그라운드 스레드) — `data/`의 perception npz를
+  절대 다시 만들려 하지 말 것. 자세한 내용은 `data/README.md`
+
+---
+
 # TODO — 카메라에서 실기까지
 
 **목표 로봇은 K1이다.** G1은 **현재 방법이 돌아가는지 보는 참고용일 뿐**이고 그 외의
