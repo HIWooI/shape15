@@ -1,0 +1,19 @@
+# Vendored upstream tree and virtualenvs — huge, and reproducible from their own sources
+GEM-X/
+.venv-ik/
+__pycache__/
+*.pyc
+
+# Datasets and trained weights: too large for git, and the datasets are not reproducible
+# anyway (perception depends on background-thread timing — see data/README.md).
+# Back these up by copying the directories, not by committing them.
+data/*.npz
+data/*.mp4
+models/*.pt
+models/*.task
+
+# Rendered videos and measurement artefacts; the numbers they illustrate live in PLAN.md
+outputs/
+
+# local tool settings
+.claude/settings.local.json
