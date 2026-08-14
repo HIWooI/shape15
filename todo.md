@@ -67,7 +67,8 @@ soma-retargeter를 PR#1 → PR#3으로 올린 뒤 다시 생성 중. 구 라벨�
 - [x] 서브모듈 업그레이드 (soma-retargeter 8dc838e + ai_sapiens 6a2af37)
 - [x] 오염 라벨·모델·오프셋 삭제
 - [x] **실데이터 15/15 클립** 완료
-- [ ] **합성 9/24 클립** 진행 중
+- [x] 실데이터 15/15 → `data/big4_k1.npz` (병리 26% → 6.6%)
+- [ ] **합성 라벨링** 진행 중 (재개됨)
 - [ ] 끝나면 `data/`로 복사 — tmp는 잡 삭제와 함께 사라진다
   ```
   cp $TMP/big4_k1.npz $TMP/synth_k1.npz data/
@@ -77,20 +78,21 @@ soma-retargeter를 PR#1 → PR#3으로 올린 뒤 다시 생성 중. 구 라벨�
 
 옛 수치(IK 28.70°, MLP 15.33°)는 오염 라벨 기준이라 전부 무효. 처음부터 다시.
 
-- [ ] **IK 기준선 + MLP 동시** — `distill.py`가 둘 다 낸다
+- [x] **IK 기준선 + MLP** — IK 26.75° / MLP plain 14.94° / **MLP res 13.97°**
   ```
   .venv-ik/bin/python distill.py data/big4_k1.npz --features pose --width 1024 \
       --model models/k1_retarget_mlp.pt
   ```
-- [ ] **오프셋 재생성** — 지금 `fixtures/k1_joint_offsets.npz`가 없어 워커는 오프셋 0
+- [x] **오프셋 재생성** — 단 7/23 관절에만 적용됨(구 22/23). 교사가 고쳐지자 상수로
+  설명되는 성분이 사라졌다는 뜻
+- [x] ~~오프셋 재생성~~ — 지금 `fixtures/k1_joint_offsets.npz`가 없어 워커는 오프셋 0
   ```
   .venv-ik/bin/python make_offsets.py data/big4_k1.npz
   ```
-- [ ] **병리율 확인** — clip 17에서 50.4% → 1.0%였던 게 전체에서도 유지되는지
-- [ ] **렌더로 눈 검증** (`tmp/render_dataset.py`를 새 라벨로).
-  이번 사태의 교훈: 자기일관성 수치는 정확성을 보장하지 않는다
-- [ ] `test_apose.py` 재실행 — **왼무릎 비대칭(22.3° vs 0.0°)이 업그레이드로
-  사라졌을 가능성이 높다**
+- [x] **병리율 확인** — 전체 6.6%, 테스트셋 0.5%, clip16 0.0% / clip17 1.0%
+- [x] **렌더로 눈 검증** → `outputs/k1_relabeled_check.mp4` (사람 vs 새 교사, 3구간 27초)
+- [x] `test_apose.py` 재실행 — **비대칭 22.3°가 그대로다.** 예상과 달리 이 결함은
+  교사가 아니라 **우리 IK 자체**의 것이었다 (4번 아래 항목으로 이동)
 
 ## 3. K1 합성 데이터 → 라벨링 → 재측정
 
@@ -103,8 +105,9 @@ soma-retargeter를 PR#1 → PR#3으로 올린 뒤 다시 생성 중. 구 라벨�
 
 ## 4. K1 정확도 올리기
 
-- [ ] **residual + LayerNorm** — plain 2층 대비 −1.28°(시드 3회 ±0.17). 4블록(8층)이
-  최적, 6·8블록은 악화. `distill.py`에 `--arch res`로 정식 편입할 것
+- [x] **residual + LayerNorm** — `distill.py --arch res`로 편입 완료.
+  새 라벨에서 재확인: plain 14.94° → **res 13.97°**
+- [ ] **왼무릎 비대칭** — 우리 IK의 결함. `test_apose.py`에서 좌 22.3° vs 우 0.0°
 - [ ] **K1 MLP** 최종 학습 → `models/k1_retarget_mlp.pt`
 - [ ] **K1 kp2d 학생** — denoiser+FK를 잘라 ~30 Hz. G1에서 MLP 11.48° vs kp2d 15.56°
   (−4.1°). K1은 출발점이 더 어려워 손실이 클 것이므로, **속도가 실제로 필요할 때만**
