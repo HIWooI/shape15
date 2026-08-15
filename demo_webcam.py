@@ -764,9 +764,16 @@ def main():
         if stream is not None:
             stream.put(shown)
         else:
+            # local window: the Calibrate button lives on the streamed page, so bind the
+            # same request to a key here
+            cv2.putText(shown, "c: calibrate   q: quit", (10, H - 12),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1, cv2.LINE_AA)
             cv2.imshow("GEM-X SOMA skeleton", shown)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
+            k = cv2.waitKey(1) & 0xFF
+            if k == ord("q"):
                 break
+            if k == ord("c"):
+                recalibrate[0] = True
         i += 1
 
     cam.stop = True

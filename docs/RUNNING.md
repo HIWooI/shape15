@@ -8,16 +8,37 @@
 
 ## 1. 빠른 실행
 
+표시 방법이 둘이다. **로컬 GUI가 기본 권장**이고, 원격에서 봐야 할 때만 스트리밍을 쓴다.
+
+### 로컬 GUI (권장)
+
 ```bash
 cd ~/Projects/shape15
 
-# 권장: K1 + 증류 MLP + 브라우저 스트리밍
+DISPLAY=:1 GEM-X/.venv/bin/python demo_webcam.py --flip --robot k1 \
+    --no_imgfeat --mlp models/k1_retarget_mlp_res.pt
+```
+
+약 40초 뒤 창 두 개가 뜬다 — `GEM-X SOMA skeleton`(카메라+스켈레톤)과
+`MuJoCo : ai_sapiens_23dof`(로봇). 카메라 창을 클릭해 포커스를 준 뒤:
+
+| 키 | 동작 |
+|---|---|
+| `c` | 캘리브레이션 — 누르고 T-포즈를 ~1초 유지 |
+| `q` | 종료 |
+
+스트리밍보다 나은 점: MJPEG 인코딩·전송이 없어 워커 부하가 줄고(JPEG+put 1.5 ms),
+MuJoCo 뷰어를 마우스로 돌리고 확대할 수 있으며, 브라우저 연결 문제가 없다.
+
+### 브라우저 스트리밍
+
+```bash
 GEM-X/.venv/bin/python demo_webcam.py --flip --robot k1 --stream 8080 \
     --no_imgfeat --mlp models/k1_retarget_mlp_res.pt
 ```
 
-약 40초 뒤 **http://<이 머신 IP>:8080** 에 두 패널(카메라+스켈레톤 / 로봇)이 뜬다.
-페이지 하단의 **Calibrate** 버튼을 누르고 T-포즈를 ~1초 유지하면 체형을 다시 잰다.
+**http://<이 머신 IP>:8080** 에 두 패널이 한 페이지로 뜨고, 하단 **Calibrate** 버튼이
+`c` 키와 같은 일을 한다. 로봇 패널은 8081에서 따로 송출된다(페이지가 합쳐 보여준다).
 
 정지: `pkill -9 -f demo_webcam.py; pkill -9 -f ik_server.py`
 
@@ -29,7 +50,7 @@ GEM-X/.venv/bin/python demo_webcam.py --flip --robot k1 --stream 8080 \
 | `--mlp PATH` | 증류 네트워크로 리타겟(권장). 없으면 PyRoki IK |
 | `--kp2d_mlp PATH` | GEM denoiser·FK를 건너뛰는 학생(~30 Hz, 정확도는 손해) |
 | `--no_imgfeat` | SAM-3D-Body 끄기. **화면 멈춤의 주원인이라 라이브에선 권장** |
-| `--stream PORT` | 브라우저로 송출(카메라 PORT, 로봇 PORT+1). 없으면 로컬 창 |
+| `--stream PORT` | 브라우저로 송출(카메라 PORT, 로봇 PORT+1). **생략하면 로컬 창** |
 | `--flip` | 화면 좌우 반전(거울처럼 보이게) |
 | `--mirror` | 로봇 좌우 반전. 거울 데모 전용, `--mlp`와 배타 |
 | `--frames` | 방향 타겟 켜기. **측정상 더 나빠서 기본 꺼짐** |
@@ -207,6 +228,7 @@ make_offsets.py ──► IK용 상수 오프셋
 | 모델 로드 시 `Error(s) in loading state_dict` | 체크포인트 구조와 코드가 불일치. `build_student()`가 `arch`/`blocks`를 읽으므로 최신 코드인지 확인 |
 | 화면이 주기적으로 멈춤 | `--no_imgfeat` 사용. 그래도면 `nvidia-smi`로 이웃 작업 경합 확인 |
 | CPU 네트워크가 수십 ms | `torch.set_num_threads(2)` 누락 |
+| GUI 창이 안 뜸 | `DISPLAY=:1`을 붙였는지 확인(`:0`은 이 머신에 없다). `xdpyinfo`로 살아있는지 확인 |
 | 영상이 VS Code에서 안 열림 | `mp4v`로 저장된 것. H.264만 재생되므로 ffmpeg으로 변환. `avc1`은 이 OpenCV 빌드에 없어 조용히 빈 파일을 만든다 |
 | 로봇이 바닥 아래 누움 | 카메라→로봇 프레임 변환 오류(축 치환) |
 | K1 로봇이 어둡게 렌더됨 | K1 MJCF에 조명 설정이 없다. 표시만의 문제 |
