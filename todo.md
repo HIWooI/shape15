@@ -1,50 +1,31 @@
-# 재시작할 때 먼저 읽기 (2026-08-14 종료 시점)
+# 재시작할 때 먼저 읽기 (2026-08-15 종료 시점)
 
-컴퓨터를 껐다 켠 뒤 이어서 하는 순서. **자산은 전부 `data/`에 보존돼 있다.**
+**자산은 전부 `data/`에 보존돼 있다.** 2026-08-14의 재시작 절차(합성 라벨링 재개,
+기준선 재측정, 누락 오프셋 재생성)는 전부 끝나서 삭제했다.
 
 ## 상태 한 줄
 
-soma-retargeter를 PR#3으로 올려 K1 교사의 왼다리 결함을 고쳤고, K1 실데이터 재라벨링은
-끝났다(병리 26% → **6.6%**). 합성 라벨링만 11/24에서 멈춰 있다.
+K1 배포 모델 **9.12°**(IK 26.75° 대비 −17.6°) — `models/k1_retarget.pt` →
+`k1_retarget_solo.pt`, 다리 전문가가 골반 위를 아예 안 본다. 라이브 16~20 FPS
+(정확도 우선 설정), 프레임간격 max 84 ms. 로드맵 1~5번 완료, 남은 것은
+6(sim)·7(real)·8(edge).
 
-## 바로 할 것
+## 바로 실행
 
-1. **합성 라벨링 이어서** — 부분결과를 tmp로 되돌린 뒤 재실행하면 11클립은 건너뛴다
-   ```
-   TMP=<이 세션의 작업 tmp>            # 새 잡이면 아무 쓰기 가능한 경로면 된다
-   cp data/big4_g1.npz.perception.npz data/synth.perception.npz $TMP/
-   cp data/partial_teacher_k1/*.npy $TMP/
-   GEM-X/.venv/bin/python make_labels.py x --out $TMP/synth_k1.npz --robot k1 \
-       --mid $TMP/synth.perception.npz --teacher      # 남은 13클립 ~15분
-   cp $TMP/synth_k1.npz data/
-   ```
-
-2. **K1 기준선 재측정** (아래 2번 항목) — 합성을 기다릴 필요 없이 지금 바로 가능
-   ```
-   .venv-ik/bin/python distill.py data/big4_k1.npz --features pose --width 1024 \
-       --model models/k1_retarget_mlp.pt
-   .venv-ik/bin/python make_offsets.py data/big4_k1.npz
-   ```
-
-## 보존된 자산
-
-| | |
-|---|---|
-| `data/big4_g1.npz.perception.npz` | 실영상 인지 9,396프레임 — **가장 비싸고 재현 불가** |
-| `data/big4_k1.npz` | **새 K1 교사 라벨** (병리 6.6%) |
-| `data/synth.perception.npz` | 합성 14,400프레임 |
-| `data/partial_teacher_k1/` | 부분결과 26개 (실 15 + 합성 11) |
-| `data/big4_g1.npz`, `synth_g1.npz` | G1 라벨 (참고용) |
-| `models/g1_*.pt` | G1 모델 (참고용) |
-| `fixtures/g1_joint_offsets.npz` | G1 오프셋. **K1 오프셋은 없다** — 재생성 필요 |
+```
+DISPLAY=:1 GEM-X/.venv/bin/python demo_webcam.py --flip --robot k1 --log logs/run.csv
+```
+`--mlp`를 생략하면 `models/k1_retarget.pt`(현재 solo)를 쓴다.
+카메라 창에서 T-포즈로 `c`(캘리브레이션), `q`(종료). 속도가 필요하면 `--no_imgfeat`를
+붙여 ~30 FPS(인지 정확도 손해), 튐이 거슬리면 `--smooth 1.5`.
 
 ## 주의
 
-- `fixtures/k1_joint_offsets.npz`가 없어 `ik_server.py --robot k1`은 오프셋 0으로 돈다.
-  잘못된 오프셋보다 낫지만, 재측정 후 `make_offsets.py`로 만들 것
-- `models/k1_retarget_mlp.pt`도 없다(오염 라벨 기반이라 삭제). 2번 실행 시 생성됨
+- 방향 타겟(`--frames`)은 다리를 뒤집으므로 기본 꺼짐. 켜기 전 `test_apose.py`
+- `--mirror`는 관절각 좌우 반전이라 거울 데모 전용. 실제 텔레오퍼레이션엔 빼라
 - 인지는 재현 불가능하다(SAM 워커가 백그라운드 스레드) — `data/`의 perception npz를
   절대 다시 만들려 하지 말 것. 자세한 내용은 `data/README.md`
+- 구현한 경로는 옵션으로 남긴다. 지우지 않는다
 
 ---
 
@@ -68,11 +49,9 @@ soma-retargeter를 PR#1 → PR#3으로 올린 뒤 다시 생성 중. 구 라벨�
 - [x] 오염 라벨·모델·오프셋 삭제
 - [x] **실데이터 15/15 클립** 완료
 - [x] 실데이터 15/15 → `data/big4_k1.npz` (병리 26% → 6.6%)
-- [ ] **합성 라벨링** 진행 중 (재개됨)
-- [ ] 끝나면 `data/`로 복사 — tmp는 잡 삭제와 함께 사라진다
-  ```
-  cp $TMP/big4_k1.npz $TMP/synth_k1.npz data/
-  ```
+- [x] **합성 라벨링 24/24** → `data/synth_k1.npz`
+- [x] 파생 합성셋도 `data/`에 보존: `synth_interp_*`(배포 학습용),
+      `synth_legstatic_*`(다리 떨림용), `legstatic_test_*`(누설 측정용)
 
 ## 2. K1 기준선 재측정
 
@@ -140,10 +119,10 @@ soma-retargeter를 PR#1 → PR#3으로 올린 뒤 다시 생성 중. 구 라벨�
   GEM-X/.venv/bin/python demo_webcam.py --flip --robot k1 --stream 8080 \
       --no_imgfeat --mlp models/k1_retarget_mlp.pt
   ```
-- [ ] **화면 멈춤 확인** — 사용자가 반복 지적한 항목. 처리량이 아니라 **프레임 간격**으로
-  판정하고(`replay_delay.py`가 median/p99/max 출력) 반드시 눈으로 볼 것.
-  원인 순서: SAM-3D-Body 토큰 버스트(~280 ms, `--no_imgfeat`로 제거) → Isaac 경합 →
-  추적 실패 재검출
+- [x] **화면 멈춤 해결** — 논블로킹 `IKLink`로 프레임간격 max 4017 → 308 ms.
+  2026-08-15 정확도 우선 실행(imgfeat **켠** 상태)에서 p50 60 / p99 75 / **max 84 ms**로
+  더 좋아졌다. 판정은 처리량이 아니라 프레임 간격으로 하고(`--log`가 열로 남긴다)
+  반드시 눈으로 볼 것
 - [ ] 다중 인물 — 추적이 bbox 전파뿐. YOLOX+ByteTrack(62 ms/frame) 가능해진 상태
 
 ## 6. 라이브 — sim (카메라 입력으로 shape14 정책을 sim에서 구동)
