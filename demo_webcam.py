@@ -300,12 +300,63 @@ def _log_summary(path, rows, frames, secs, n_calib, n_drop):
     print(f"  per-frame rows -> {path}")
 
 
+class _PartExperts(torch.nn.Module):
+    """One expert per body part, each reading only its own chain of the input.
+
+    The point is not accuracy — it matches a single net (9.14 deg here) — it is that the
+    leg expert never sees an arm input, so raising an arm cannot move a leg. A single net
+    maps all 228 inputs to all 23 outputs and moved the legs up to 31 deg for a 10 deg
+    arm perturbation, which is visible and wrong on screen.
+
+    Each expert carries its own normalisation, so this holds its inputs unnormalised and
+    scales per part.
+    """
+
+    def __init__(self, ck, ndof):
+        super().__init__()
+        self.ndof = ndof
+        self.nets, self.idx = torch.nn.ModuleDict(), {}
+        for name, p in ck["parts"].items():
+            w, nb = ck["width"], ck.get("blocks", 4)
+            net = torch.nn.Sequential(
+                torch.nn.Linear(len(p["in"]), w), *[_ResBlock(w) for _ in range(nb)],
+                torch.nn.LayerNorm(w), torch.nn.Linear(w, len(p["out"])))
+            net.load_state_dict(_remap_block_keys(p["state"]))
+            net.eval()
+            self.nets[name] = net
+            self.idx[name] = (
+                torch.tensor(np.asarray(p["in"]), dtype=torch.long),
+                torch.tensor(np.asarray(p["out"]), dtype=torch.long),
+                torch.tensor(np.asarray(p["mu"]), dtype=torch.float32),
+                torch.tensor(np.asarray(p["sd"]), dtype=torch.float32),
+            )
+
+    def forward(self, x):
+        out = x.new_zeros(self.ndof)
+        for name, net in self.nets.items():
+            ci, co, mu, sd = self.idx[name]
+            out[co] = net((x[ci] - mu) / sd)
+        return out
+
+
+def _remap_block_keys(state):
+    """distill.py names the block's LayerNorm `norm`, this file's `_ResBlock` names it `n`.
+
+    Both spellings exist in saved checkpoints, and the mismatch fails the load with a
+    bare "Missing key(s)". Accept either rather than invalidating trained weights.
+    """
+    return {k.replace(".norm.", ".n."): v for k, v in state.items()}
+
+
 def build_student(ck, ndof, extra_out=0):
     """Rebuild a distill.py checkpoint's network from the shape it recorded.
 
-    The checkpoint carries `arch`/`blocks`, so a plain and a residual model both load
-    through the same call — older checkpoints have neither and default to plain.
+    The checkpoint carries `arch`/`blocks`, so plain, residual and per-part models all
+    load through the same call — older checkpoints have neither and default to plain.
+    A per-part model normalises internally, so callers must feed it raw features.
     """
+    if str(ck.get("arch", "plain")) == "parts":
+        return _PartExperts(ck, ndof)
     w, nb = ck["width"], ck.get("blocks", 4)
     n_out = ndof + extra_out
     if str(ck.get("arch", "plain")) == "plain":
@@ -696,16 +747,20 @@ def main():
         ck = torch.load(HERE / args.mlp, map_location="cpu", weights_only=False)
         assert len(ck["names"]) == ik_ndof, f"model is for {len(ck['names'])} DOF, robot has {ik_ndof}"
         mlp_net = build_student(ck, ik_ndof)
-        mlp_net.load_state_dict(ck["state"])
+        if "state" in ck:
+            mlp_net.load_state_dict(_remap_block_keys(ck["state"]))
         mlp_net.eval()
-        mlp_mu = torch.tensor(np.asarray(ck["mu"]), dtype=torch.float32)
-        mlp_sd = torch.tensor(np.asarray(ck["sd"]), dtype=torch.float32)
+        mlp_parts = str(ck.get("arch", "plain")) == "parts"   # normalises per expert
+        mlp_mu = None if mlp_parts else torch.tensor(np.asarray(ck["mu"]), dtype=torch.float32)
+        mlp_sd = None if mlp_parts else torch.tensor(np.asarray(ck["sd"]), dtype=torch.float32)
         mlp_feats = str(ck.get("features", "pose"))  # pose_conf models also read confidence
 
         def mlp(bp, conf):
             x = bp
             if mlp_feats == "pose_conf":
                 x = torch.cat([bp, torch.tensor(conf, dtype=torch.float32)])
+            if mlp_parts:
+                return mlp_net(x).numpy().astype("<f4")
             return mlp_net((x - mlp_mu) / mlp_sd).numpy().astype("<f4")
 
     calib_left, calib_send = 0, False  # prompt frames left; request still to reach the worker

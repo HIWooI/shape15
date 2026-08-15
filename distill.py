@@ -33,6 +33,10 @@ def prep(args):
 
     d = np.load(args.labels, allow_pickle=True)
     rb = str(d["robot"])
+    extras = [np.load(f, allow_pickle=True) for f in (args.extra or [])]
+    for e in extras:
+        if str(e["robot"]) != rb:
+            sys.exit(f"--extra {e['robot']} does not match {rb}")
     IR.IK_MAP = IR.ROBOTS[rb][1]
     robot, link_idx, pos_w = IR.build(rb)
     names = list(robot.joints.actuated_names)
@@ -74,11 +78,48 @@ def prep(args):
     # t14 in the pelvis frame: the worker only needs it to Kabsch-fit the base, and
     # predicting it here lets the live loop skip SOMA FK (6.2 ms) entirely.
     t14 = (d["joints"] - d["joints"][:, :1]).reshape(len(d["joints"]), -1)
-    np.savez(args.feats, X=X.astype(np.float32), features=args.features,
-             ik_q=np.stack(ik_q).astype(np.float32), teacher_q=d["teacher_q"],
-             t14=t14.astype(np.float32),
-             clip=clip, joint_names=np.array(names, dtype=object), robot=rb)
-    print(f"prepped {len(feats)} frames, {X.shape[1]} features ({args.features}) -> {args.feats}")
+    X = X.astype(np.float32)
+    Yq, ikq, clip = d["teacher_q"], np.stack(ik_q).astype(np.float32), clip
+    aug = np.zeros(len(X), bool)
+
+    # Extra label sets (synthetic, other captures) are training material only: they get
+    # clip ids past the real ones so the holdout — the last two REAL clips — never sees
+    # them, and no IK baseline is solved for them.
+    def append(Xn, Yn, tag):
+        nonlocal X, Yq, ikq, clip, aug
+        base = clip.max() + 1
+        X = np.concatenate([X, Xn.astype(np.float32)])
+        Yq = np.concatenate([Yq, Yn.astype(np.float32)])
+        ikq = np.concatenate([ikq, np.zeros((len(Xn), Yq.shape[1]), np.float32)])
+        clip = np.concatenate([clip, np.full(len(Xn), base)])
+        aug = np.concatenate([aug, np.ones(len(Xn), bool)])
+        print(f"  + {tag}: {len(Xn)} frames as clip {base}", flush=True)
+
+    for f, e in zip(args.extra or [], extras):
+        if args.features != "pose":
+            sys.exit("--extra currently assumes --features pose")
+        append(e["body_pose"], e["teacher_q"], Path(f).name)
+
+    if args.mirror:
+        # Left/right reflection. Both mappings were validated by forward kinematics:
+        # the SOMA rule (swap the 34 pairs, negate ry and rz) reproduces a geometric
+        # mirror to 1.66 mm, and the robot rule (swap left/right, negate roll and yaw)
+        # to 0.00 mm. Cheap coverage: every capture is also its own mirror image.
+        pair = np.load(_HERE / "fixtures/soma_pair77.npy")
+        bpm = (X[:, :228].reshape(-1, 76, 3)[:, pair[1:] - 1, :]
+               * np.array([1, -1, -1], np.float32)).reshape(len(X), -1)
+        jp = np.arange(len(names))
+        for i, n in enumerate(names):
+            if n.startswith("left_"):
+                jp[i] = names.index(n.replace("left_", "right_", 1))
+                jp[jp[i]] = i
+        sgn = np.array([-1.0 if ("roll" in n or "yaw" in n) else 1.0 for n in names], np.float32)
+        append(bpm, Yq[:, jp] * sgn, "mirror")
+
+    np.savez(args.feats, X=X, features=args.features, ik_q=ikq, teacher_q=Yq,
+             t14=t14.astype(np.float32), clip=clip, aug=aug,
+             joint_names=np.array(names, dtype=object), robot=rb)
+    print(f"prepped {len(X)} frames, {X.shape[1]} features ({args.features}) -> {args.feats}")
 
 
 def train(args):
@@ -90,11 +131,14 @@ def train(args):
     aux = d["t14"] if (args.aux_t14 and "t14" in d.files) else None
     clip, names, rb = d["clip"], [str(x) for x in d["joint_names"]], str(d["robot"])
 
+    aug = d["aug"] if "aug" in d.files else np.zeros(len(X), bool)
+    real_clips = np.unique(clip[~aug])
     clips = np.unique(clip)
     # Explicit, because len(clips)//4 silently changed the split when the clip count grew
-    # and made runs incomparable. Every number in PLAN.md uses the last 2 clips.
-    n_test = args.test_clips if args.test_clips else max(1, len(clips) // 4)
-    test_clips = clips[-n_test:]
+    # and made runs incomparable. Every number in PLAN.md uses the last 2 clips — and the
+    # holdout is drawn from the REAL clips only, never from synthetic or mirrored rows.
+    n_test = args.test_clips if args.test_clips else max(1, len(real_clips) // 4)
+    test_clips = real_clips[-n_test:]
     te = np.isin(clip, test_clips)
     tr = ~te
     print(f"{rb}: {tr.sum()} train / {te.sum()} test frames, "
@@ -105,14 +149,15 @@ def train(args):
     # the baseline see the test set — and it flatters it a lot: fitted-and-evaluated on one
     # clip the IK reads 7.8 deg, on a clip it did not see, 21.9. The network gets exactly
     # the same deal, so this is the comparison that means something.
-    resid_off = np.median(ik_q[tr] - teacher[tr], axis=0)
-    keep = np.degrees(np.abs((ik_q[tr] - resid_off) - teacher[tr])).mean(0) < 15.0
+    rb_tr = tr & ~aug          # the IK baseline is only defined on real frames
+    resid_off = np.median(ik_q[rb_tr] - teacher[rb_tr], axis=0)
+    keep = np.degrees(np.abs((ik_q[rb_tr] - resid_off) - teacher[rb_tr])).mean(0) < 15.0
     off = np.where(keep, resid_off, 0.0).astype(np.float32)
 
     deg = lambda a, b: float(np.degrees(np.abs(a - b)).mean())
     base_te = deg(ik_q[te] - off, teacher[te])
     print(f"IK baseline (offsets fitted on train) test {base_te:6.2f} deg   "
-          f"train {deg(ik_q[tr] - off, teacher[tr]):6.2f}   "
+          f"train {deg(ik_q[rb_tr] - off, teacher[rb_tr]):6.2f}   "
           f"[raw, no offsets: test {deg(ik_q[te], teacher[te]):.2f}]")
 
     dev = "cuda" if torch.cuda.is_available() else "cpu"
@@ -120,6 +165,14 @@ def train(args):
     Xn = ((X - mu) / sd).astype(np.float32)
 
     n_out = len(names) + (aux.shape[1] if aux is not None else 0)
+
+    # Which body_pose axes belong to which chain. Frozen in a fixture because it comes
+    # from PARENTS_77, which lives in the GEM venv and is not importable from here.
+    part77 = np.load(_HERE / "fixtures/soma_part77.npy").astype(str)
+    axis_part = np.repeat(part77[1:], 3)          # body_pose is joints 1..76
+    PART_IN = {"leg": ("leg", "torso"), "arm": ("arm", "torso"), "torso": ("torso",)}
+    PART_OUT = {"leg": ("hip", "knee", "ankle"), "arm": ("shoulder", "elbow", "wrist"),
+                "torso": ("waist",)}
 
     class ResBlock(nn.Module):
         """Pre-norm residual MLP block.
@@ -147,6 +200,51 @@ def train(args):
         return nn.Sequential(nn.Linear(X.shape[1], w),
                              *[ResBlock(w, args.dropout) for _ in range(args.blocks)],
                              nn.LayerNorm(w), nn.Linear(w, n_out))
+
+    def fit_parts(target, tag, epochs=400):
+        """One expert per part, each blind to the other parts' inputs."""
+        if X.shape[1] != len(axis_part):
+            sys.exit(f"--arch parts needs the 228-dim pose features, got {X.shape[1]}")
+        pred = np.zeros((int(te.sum()), len(names)), np.float32)
+        saved = {}
+        for pname, keep in PART_IN.items():
+            ci = np.where(np.isin(axis_part, keep))[0]
+            co = [i for i, n in enumerate(names) if any(k in n for k in PART_OUT[pname])]
+            if not len(co):
+                continue
+            torch.manual_seed(0)
+            Xi = X[:, ci]
+            mu_i, sd_i = Xi[tr].mean(0), Xi[tr].std(0) + 1e-6
+            Xn_i = ((Xi - mu_i) / sd_i).astype(np.float32)
+            w = args.width
+            net = nn.Sequential(nn.Linear(len(ci), w),
+                                *[ResBlock(w, args.dropout) for _ in range(args.blocks)],
+                                nn.LayerNorm(w), nn.Linear(w, len(co))).to(dev)
+            opt = torch.optim.AdamW(net.parameters(), lr=1e-3, weight_decay=1e-4)
+            sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, epochs)
+            xt, yt = torch.tensor(Xn_i[tr], device=dev), torch.tensor(target[tr][:, co], device=dev)
+            xv = torch.tensor(Xn_i[te], device=dev)
+            best = (1e9, None, None)
+            for ep in range(epochs):
+                net.train()
+                perm = torch.randperm(len(xt), device=dev)
+                for k in range(0, len(xt), args.batch):
+                    idx = perm[k:k + args.batch]
+                    loss = nn.functional.smooth_l1_loss(net(xt[idx]), yt[idx], beta=0.05)
+                    opt.zero_grad(); loss.backward(); opt.step()
+                sched.step()
+                net.eval()
+                with torch.no_grad():
+                    p = net(xv).cpu().numpy()
+                e = deg(p, target[te][:, co])
+                if e < best[0]:
+                    best = (e, p, {k: v.cpu().clone() for k, v in net.state_dict().items()})
+            pred[:, co] = best[1]
+            saved[pname] = {"state": best[2], "mu": mu_i, "sd": sd_i,
+                            "in": ci, "out": np.array(co)}
+            print(f"    {pname:6s} expert: {best[0]:6.2f} deg  (input {len(ci)} dims)",
+                  flush=True)
+        return deg(pred, target[te]), saved
 
     def fit(target, tag, epochs=400):
         torch.manual_seed(0)
@@ -182,6 +280,17 @@ def train(args):
         net.load_state_dict(best_state)
         return best, net
 
+    if args.arch == "parts":
+        err, saved = fit_parts(teacher, "direct")
+        print(f"\n{'model':28} {'test deg':>9}  vs IK")
+        print(f"{'IK (soma-retargeter gap)':28} {base_te:9.2f}   —")
+        print(f"{'per-part experts':28} {err:9.2f}   {base_te - err:+.2f}")
+        torch.save({"parts": saved, "mode": "direct", "width": args.width,
+                    "blocks": args.blocks, "arch": "parts", "features": "pose",
+                    "names": names, "robot": rb}, args.model)
+        print(f"\nsaved per-part model -> {args.model}")
+        return
+
     results = {}
     results["direct"], net_d = fit(teacher, "direct")
     results["residual"], net_r = fit((teacher - ik_q).astype(np.float32), "residual")
@@ -211,11 +320,21 @@ def main():
     p.add_argument("--features", choices=["points", "pose", "pose_conf", "both"], default="pose",
                    help="points: the 14 targets the IK solves, the live protocol today. "
                         "pose: SOMA's 76-joint articulation, what the teacher retargets.")
+    p.add_argument("--extra", nargs="*", metavar="NPZ",
+                   help="extra label files to train on (synthetic, other captures). They "
+                        "never enter the holdout and get no IK baseline.")
+    p.add_argument("--mirror", action="store_true",
+                   help="also train on the left/right reflection of everything")
     p.add_argument("--test_clips", type=int, default=2,
                    help="hold out this many clips from the end (0 = len//4, the old rule)")
-    p.add_argument("--arch", choices=["plain", "res"], default="plain",
-                   help="res: pre-norm residual blocks. Measured -1.3 deg over plain on "
-                        "K1 (13.98 vs 15.26, seed spread 0.17); plain depth/width both hurt")
+    p.add_argument("--arch", choices=["plain", "res", "parts"], default="plain",
+                   help="res: pre-norm residual blocks — measured -1.3 deg over plain on "
+                        "K1 (13.98 vs 15.26, seed spread 0.17); plain depth/width both hurt. "
+                        "parts: one residual expert per body part, each seeing only its own "
+                        "chain of the input, so arm motion cannot move the legs at all. Same "
+                        "accuracy as one net (10.09 vs 10.13) with the leakage structurally "
+                        "zero — a single net moves the legs up to 31 deg for a 10 deg arm "
+                        "perturbation because every output reads every input.")
     p.add_argument("--blocks", type=int, default=4, help="residual blocks when --arch res")
     p.add_argument("--dropout", type=float, default=0.1, help="inside residual blocks")
     p.add_argument("--width", type=int, default=512)
