@@ -144,7 +144,25 @@ def _self_check():
     assert vn < 5.0, f"jitter amplified into {vn:.1f} rad/s"
 
     assert MotionCommand.ori6(np.eye(3)).tolist() == [1, 0, 0, 0, 1, 0]
-    print(f"ok: ramp {v.mean():.2f} rad/s, jitter peak {vn:.2f}, clamped jump {vj:.2f} rad/s")
+
+    # demo_webcam's --smooth passes the *measured* dt rather than a nominal frame period,
+    # because the camera rate moves (16-30 fps depending on what else has the GPU) and a
+    # fixed dt would silently change how much smoothing the same cutoff applies. A
+    # first-order filter is only exactly rate-independent in the continuous limit, so the
+    # check is that the measured-dt path tracks that limit better than a fixed-dt one.
+    T, cut = 0.25, 3.0
+    want = 1 - np.exp(-T * 2 * np.pi * cut)
+    fps, assumed = 16.0, 30.0
+    real, wrong = OneEuro(1, cut, beta=0.0), OneEuro(1, cut, beta=0.0)
+    real(np.zeros(1), 1 / fps)
+    wrong(np.zeros(1), 1 / assumed)
+    for _ in range(int(fps * T)):
+        a, b = real(np.ones(1), 1 / fps), wrong(np.ones(1), 1 / assumed)
+    assert abs(a[0] - want) < abs(b[0] - want), (
+        f"measured dt should beat assuming {assumed:.0f} fps: {a[0]:.3f} vs {b[0]:.3f}, "
+        f"continuous {want:.3f}")
+    print(f"ok: ramp {v.mean():.2f} rad/s, jitter peak {vn:.2f}, clamped jump {vj:.2f} rad/s, "
+          f"dt-aware step {a[0]:.3f} vs fixed-dt {b[0]:.3f} (continuous {want:.3f})")
 
 
 if __name__ == "__main__":

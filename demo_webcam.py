@@ -53,6 +53,7 @@ import cv2
 import numpy as np
 import torch
 
+from motion_command import OneEuro  # plain numpy, so it imports from either venv
 from gem.utils.cam_utils import estimate_K
 from gem.utils.geo_transform import compute_cam_angvel, get_bbx_xys_from_xyxy
 from gem.utils.kp2d_utils import (
@@ -645,6 +646,11 @@ def main():
                         "reads 10.2 deg against soma-retargeter where the IK reads 26.8.")
     p.add_argument("--ik", action="store_true",
                    help="force the PyRoki IK solver instead of the distilled network")
+    p.add_argument("--smooth", type=float, default=2.0, metavar="HZ",
+                   help="low-pass the network's joint angles at this cutoff. Free at the "
+                        "default: at the demo's real 15 fps the holdout goes 9.01 -> 8.93 "
+                        "deg while the worst single-frame pop goes 238 -> 108. 0 disables; "
+                        "1.5 cuts the pops to 90 for +0.03 deg.")
     p.add_argument("--log", metavar="CSV",
                    help="record one row per frame (wall time, frame gap, per-stage ms, "
                         "tracking state, whether the worker took the frame) and print a "
@@ -772,13 +778,27 @@ def main():
         mlp_sd = None if mlp_parts else torch.tensor(np.asarray(ck["sd"]), dtype=torch.float32)
         mlp_feats = str(ck.get("features", "pose"))  # pose_conf models also read confidence
 
+        # The student's frame-to-frame noise is larger than the teacher's, so low-passing
+        # the output moves it *towards* the teacher -- the holdout improves rather than
+        # degrades, at 15 and 30 fps alike, while the worst single-frame pop more than
+        # halves. Those pops are shoulder pitch/yaw and elbow: the student amplifies a
+        # 56 deg teacher discontinuity into 122. beta stays 0 on purpose, since one-euro's
+        # speed adaptation widens the cutoff exactly when the pops happen and passes them.
+        smooth = OneEuro(ik_ndof, min_cutoff=args.smooth, beta=0.0) if args.smooth else None
+        t_smooth = [None]
+
         def mlp(bp, conf):
             x = bp
             if mlp_feats == "pose_conf":
                 x = torch.cat([bp, torch.tensor(conf, dtype=torch.float32)])
-            if mlp_parts:
-                return mlp_net(x).numpy().astype("<f4")
-            return mlp_net((x - mlp_mu) / mlp_sd).numpy().astype("<f4")
+            q = (mlp_net(x) if mlp_parts else mlp_net((x - mlp_mu) / mlp_sd)).numpy()
+            if smooth is not None:
+                now = time.time()
+                # real dt, so the cutoff means the same thing at 16 fps as at 30
+                dt = 1 / 30 if t_smooth[0] is None else min(max(now - t_smooth[0], 1e-3), 0.5)
+                t_smooth[0] = now
+                q = smooth(q, dt)
+            return q.astype("<f4")
 
     calib_left, calib_send = 0, False  # prompt frames left; request still to reach the worker
     logf, log_rows, t_prev, n_calib, n_drop = None, [], None, 0, 0

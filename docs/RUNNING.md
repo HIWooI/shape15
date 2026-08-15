@@ -50,6 +50,7 @@ GEM-X/.venv/bin/python demo_webcam.py --flip --robot k1 --stream 8080 \
 |---|---|
 | `--robot k1\|g1` | 대상 로봇. K1이 목표 로봇, G1은 참고용 |
 | `--mlp PATH` | 다른 증류 체크포인트 지정. 기본은 `models/<robot>_retarget.pt` |
+| `--smooth HZ` | 관절각 저역통과. 기본 2.0 — 정확도를 깎지 않고(9.01→8.93°) 최악 점프를 238→108°로 줄인다. `0`이면 끔 |
 | `--ik` | 증류 네트워크 대신 PyRoki 솔버 강제 |
 | `--kp2d_mlp PATH` | GEM denoiser·FK를 건너뛰는 학생(~30 Hz, 정확도는 손해) |
 | `--no_imgfeat` | SAM-3D-Body 끄기. **화면 멈춤의 주원인이라 라이브에선 권장** |
