@@ -281,7 +281,7 @@ class _ResBlock(torch.nn.Module):
         return x + self.f(self.n(x))
 
 
-def _log_summary(path, rows, frames, secs, n_calib, n_drop):
+def _log_summary(path, rows, frames, secs, n_calib, n_drop, n_reset=0):
     """What the session actually did, in the terms that matter for a freeze."""
     if not rows:
         print(f"[log] no frames recorded -> {path}")
@@ -298,6 +298,8 @@ def _log_summary(path, rows, frames, secs, n_calib, n_drop):
         if len(v):
             print(f"  {k:12s} : median {np.median(v):6.1f}  p99 {pc(v, 99):6.1f}")
     print(f"  calibrations {n_calib}, frames the worker could not take {n_drop}")
+    # every reset throws away the denoiser's 64-frame window and shows as a pose jump
+    print(f"  tracking resets {n_reset}" + (f" (one per {secs / n_reset:.0f} s)" if n_reset else ""))
     print(f"  per-frame rows -> {path}")
 
 
@@ -795,12 +797,15 @@ def main():
             if smooth is not None:
                 now = time.time()
                 # real dt, so the cutoff means the same thing at 16 fps as at 30
-                dt = 1 / 30 if t_smooth[0] is None else min(max(now - t_smooth[0], 1e-3), 0.5)
+                # capped: a stalled frame must not widen the cutoff just as the pose jumps
+                dt = 1 / 30 if t_smooth[0] is None else min(max(now - t_smooth[0], 1e-3), 0.15)
                 t_smooth[0] = now
                 q = smooth(q, dt)
             return q.astype("<f4")
 
     calib_left, calib_send = 0, False  # prompt frames left; request still to reach the worker
+    LOST_AFTER = 3          # consecutive frames without a box before the window is dropped
+    n_miss, n_reset = 0, 0
     logf, log_rows, t_prev, n_calib, n_drop = None, [], None, 0, 0
     if args.log:
         logf = open(HERE / args.log, "w", buffering=1)
@@ -832,18 +837,30 @@ def main():
               token = worker.submit(frame, bbx)  # returns the latest finished token
               if token is not None:
                   tok_win.append(token)
-          bbx = bbox_from_kps(kp2d, W, H)
-          if bbx is None:
+          nbx = bbox_from_kps(kp2d, W, H)
+          if nbx is None:
               tracked = 0
-          if bbx is None:  # lost the person, re-detect from scratch
+              n_miss += 1
+          else:
+              n_miss = 0
+          if nbx is None and n_miss < LOST_AFTER:
+              # A single bad frame is not a lost person. Measured over 258 s of live use:
+              # 149 dropouts, 143 of them exactly one frame — and each one was clearing the
+              # 64-frame window and resetting the token worker, so the denoiser restarted
+              # from 16 fresh frames roughly every 1.7 s and the pose visibly jumped. Hold
+              # the last box instead; `tracked` still records the miss.
+              nbx = bbx
+          if nbx is None:  # really gone, re-detect from scratch
               # one pass, not three: re-detection happens mid-stream and a 1.7 s stall is
               # worse than a slightly worse box, which the next frames correct anyway
-              bbx, xy3d = bootstrap_bbox(vitpose, frame, W, H, rounds=1), None
+              nbx, xy3d = bootstrap_bbox(vitpose, frame, W, H, rounds=1), None
               kp2d_win.clear()
               bbx_win.clear()
               tok_win.clear()
-              if worker is not None:
+              n_reset, n_miss = n_reset + 1, 0   # so a long absence re-detects every
+              if worker is not None:             # LOST_AFTER frames, not every frame
                   worker.reset()
+          bbx = nbx
 
           if kp2d_net is not None and ik is not None:
               # stage-cut path: no denoiser, no FK — the student answers from the 2D window
@@ -942,7 +959,7 @@ def main():
         print("\n[log] interrupted", flush=True)
     if logf is not None:
         logf.close()
-        _log_summary(args.log, log_rows, i, time.time() - t_start, n_calib, n_drop)
+        _log_summary(args.log, log_rows, i, time.time() - t_start, n_calib, n_drop, n_reset)
     cam.stop = True
     if ik is not None:
         ik.close()
