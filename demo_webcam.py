@@ -571,10 +571,12 @@ def main():
                    help="serve the view over HTTP instead of opening local windows "
                         "(camera on PORT, robot on PORT+1)")
     p.add_argument("--mlp", metavar="PT",
-                   help="retarget with a distilled network instead of the IK: joint "
-                        "angles come from this distill.py checkpoint reading SOMA's "
-                        "body_pose; the worker only fits the base for display. "
-                        "11.5 deg vs soma-retargeter where the IK reads 19.6.")
+                   help="distilled-network checkpoint to retarget with. Defaults to "
+                        "models/<robot>_retarget.pt when that exists, so the network is "
+                        "the normal path and the IK is the fallback — on K1 the network "
+                        "reads 10.2 deg against soma-retargeter where the IK reads 26.8.")
+    p.add_argument("--ik", action="store_true",
+                   help="force the PyRoki IK solver instead of the distilled network")
     p.add_argument("--log", metavar="CSV",
                    help="record one row per frame (wall time, frame gap, per-stage ms, "
                         "tracking state, whether the worker took the frame) and print a "
@@ -585,10 +587,22 @@ def main():
                         "14 targets, skipping the GEM denoiser and SOMA FK entirely. "
                         "~30 Hz instead of ~17, at 15.6 deg vs the full path's 11.5.")
     args = p.parse_args()
-    if (args.mlp or args.kp2d_mlp) and args.mirror:
-        p.error("--mlp joint angles are not mirrored; drop --mirror")
     if args.mlp and args.kp2d_mlp:
         p.error("--mlp and --kp2d_mlp are different retarget sources; pick one")
+    if args.ik and (args.mlp or args.kp2d_mlp):
+        p.error("--ik forces the solver; drop --mlp/--kp2d_mlp")
+    # The network is the default path. Fall back to the IK only when asked (--ik), when
+    # another student is chosen, or when no checkpoint has been trained for this robot.
+    if not (args.ik or args.mlp or args.kp2d_mlp) and args.robot:
+        default_ck = HERE / "models" / f"{args.robot}_retarget.pt"
+        if default_ck.exists():
+            args.mlp = str(default_ck.relative_to(HERE))
+            print(f"[retarget] {args.mlp} (--ik for the solver instead)", flush=True)
+        else:
+            print(f"[retarget] no {default_ck.name}; falling back to the IK solver",
+                  flush=True)
+    if (args.mlp or args.kp2d_mlp) and args.mirror:
+        p.error("--mlp joint angles are not mirrored; drop --mirror")
 
     from gem.utils.vitpose_extractor import VitPoseExtractor
 

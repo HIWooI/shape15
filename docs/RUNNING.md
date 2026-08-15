@@ -15,9 +15,11 @@
 ```bash
 cd ~/Projects/shape15
 
-DISPLAY=:1 GEM-X/.venv/bin/python demo_webcam.py --flip --robot k1 \
-    --no_imgfeat --mlp models/k1_retarget_mlp_res.pt
+DISPLAY=:1 GEM-X/.venv/bin/python demo_webcam.py --flip --robot k1 --no_imgfeat
 ```
+
+증류 네트워크가 **기본 경로**다 — `models/<robot>_retarget.pt`가 있으면 자동으로 쓰고,
+없거나 `--ik`를 주면 PyRoki 솔버로 떨어진다. 다른 체크포인트는 `--mlp PATH`로 지정한다.
 
 약 40초 뒤 창 두 개가 뜬다 — `GEM-X SOMA skeleton`(카메라+스켈레톤)과
 `MuJoCo : ai_sapiens_23dof`(로봇). 카메라 창을 클릭해 포커스를 준 뒤:
@@ -47,7 +49,8 @@ GEM-X/.venv/bin/python demo_webcam.py --flip --robot k1 --stream 8080 \
 | 플래그 | 뜻 |
 |---|---|
 | `--robot k1\|g1` | 대상 로봇. K1이 목표 로봇, G1은 참고용 |
-| `--mlp PATH` | 증류 네트워크로 리타겟(권장). 없으면 PyRoki IK |
+| `--mlp PATH` | 다른 증류 체크포인트 지정. 기본은 `models/<robot>_retarget.pt` |
+| `--ik` | 증류 네트워크 대신 PyRoki 솔버 강제 |
 | `--kp2d_mlp PATH` | GEM denoiser·FK를 건너뛰는 학생(~30 Hz, 정확도는 손해) |
 | `--no_imgfeat` | SAM-3D-Body 끄기. **화면 멈춤의 주원인이라 라이브에선 권장** |
 | `--stream PORT` | 브라우저로 송출(카메라 PORT, 로봇 PORT+1). **생략하면 로컬 창** |
