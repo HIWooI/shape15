@@ -173,6 +173,18 @@ def train(args):
     PART_IN = {"leg": ("leg", "torso"), "arm": ("arm", "torso"), "torso": ("torso",)}
     PART_OUT = {"leg": ("hip", "knee", "ankle"), "arm": ("shoulder", "elbow", "wrist"),
                 "torso": ("waist",)}
+    if args.part_in == "tight":
+        # Cut the torso at the shoulders. "torso" lumps the spine in with the clavicles
+        # (joints 11 and 39) and the head chain (4-10), and the clavicles rotate whenever
+        # the arms move -- so with the wide split the leg expert has a live arm input even
+        # though it never sees an arm joint. The spine (1,2,3) is the part that genuinely
+        # moves the legs, so only that reaches them.
+        fine = part77[1:].copy()                  # index i is joint i+1
+        fine[[0, 1, 2]] = "spine"                 # joints 1-3
+        fine[[3, 4, 5, 6, 7, 8, 9, 10, 38]] = "upper"   # head chain 4-11 and clavicle 39
+        axis_part = np.repeat(fine, 3)
+        PART_IN = {"leg": ("leg", "spine"), "arm": ("arm", "spine", "upper"),
+                   "torso": ("spine", "upper")}
 
     class ResBlock(nn.Module):
         """Pre-norm residual MLP block.
@@ -205,7 +217,7 @@ def train(args):
         """One expert per part, each blind to the other parts' inputs."""
         if X.shape[1] != len(axis_part):
             sys.exit(f"--arch parts needs the 228-dim pose features, got {X.shape[1]}")
-        pred = np.zeros((int(te.sum()), len(names)), np.float32)
+        full = np.zeros((len(X), len(names)), np.float32)   # every row, for --fuse
         saved = {}
         for pname, keep in PART_IN.items():
             ci = np.where(np.isin(axis_part, keep))[0]
@@ -224,7 +236,7 @@ def train(args):
             sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, epochs)
             xt, yt = torch.tensor(Xn_i[tr], device=dev), torch.tensor(target[tr][:, co], device=dev)
             xv = torch.tensor(Xn_i[te], device=dev)
-            best = (1e9, None, None)
+            best = (1e9, None)
             for ep in range(epochs):
                 net.train()
                 perm = torch.randperm(len(xt), device=dev)
@@ -238,13 +250,57 @@ def train(args):
                     p = net(xv).cpu().numpy()
                 e = deg(p, target[te][:, co])
                 if e < best[0]:
-                    best = (e, p, {k: v.cpu().clone() for k, v in net.state_dict().items()})
-            pred[:, co] = best[1]
-            saved[pname] = {"state": best[2], "mu": mu_i, "sd": sd_i,
+                    best = (e, {k: v.cpu().clone() for k, v in net.state_dict().items()})
+            net.load_state_dict(best[1])
+            net.eval()
+            with torch.no_grad():
+                for k in range(0, len(Xn_i), 8192):
+                    full[k:k + 8192, co] = net(
+                        torch.tensor(Xn_i[k:k + 8192], device=dev)).cpu().numpy()
+            saved[pname] = {"state": best[1], "mu": mu_i, "sd": sd_i,
                             "in": ci, "out": np.array(co)}
             print(f"    {pname:6s} expert: {best[0]:6.2f} deg  (input {len(ci)} dims)",
                   flush=True)
-        return deg(pred, target[te]), saved
+
+        err = deg(full[te], target[te])
+        if args.fuse:
+            # The experts cannot see each other, which is the point -- but the teacher
+            # does couple them (a raised arm shifts the stance), and the leg expert has no
+            # way to know. Let a small head correct the assembled pose from the assembled
+            # pose alone: 23 robot angles in, 23 deltas out. The coupling it can express is
+            # bounded by that bottleneck, unlike a single net reading all 228 raw inputs.
+            torch.manual_seed(0)
+            fmu, fsd = full[tr].mean(0), full[tr].std(0) + 1e-6
+            Fn = ((full - fmu) / fsd).astype(np.float32)
+            head = nn.Sequential(nn.Linear(len(names), 256), nn.GELU(),
+                                 nn.Linear(256, 256), nn.GELU(),
+                                 nn.Linear(256, len(names))).to(dev)
+            head[-1].weight.data.zero_(); head[-1].bias.data.zero_()   # start at identity
+            opt = torch.optim.AdamW(head.parameters(), lr=1e-3, weight_decay=1e-4)
+            sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, epochs)
+            ft = torch.tensor(Fn[tr], device=dev)
+            bt = torch.tensor(full[tr], device=dev)
+            yt = torch.tensor(target[tr][:, :len(names)], device=dev)
+            fv, bv = torch.tensor(Fn[te], device=dev), torch.tensor(full[te], device=dev)
+            best = (1e9, None)
+            for ep in range(epochs):
+                head.train()
+                perm = torch.randperm(len(ft), device=dev)
+                for k in range(0, len(ft), args.batch):
+                    idx = perm[k:k + args.batch]
+                    loss = nn.functional.smooth_l1_loss(bt[idx] + head(ft[idx]), yt[idx],
+                                                        beta=0.05)
+                    opt.zero_grad(); loss.backward(); opt.step()
+                sched.step()
+                head.eval()
+                with torch.no_grad():
+                    e = deg((bv + head(fv)).cpu().numpy(), target[te])
+                if e < best[0]:
+                    best = (e, {k: v.cpu().clone() for k, v in head.state_dict().items()})
+            print(f"    fuse head:      {best[0]:6.2f} deg  (was {err:.2f})", flush=True)
+            saved["_fuse"] = {"state": best[1], "mu": fmu, "sd": fsd}
+            err = best[0]
+        return err, saved
 
     def fit(target, tag, epochs=400):
         torch.manual_seed(0)
@@ -335,6 +391,11 @@ def main():
                         "accuracy as one net (10.09 vs 10.13) with the leakage structurally "
                         "zero — a single net moves the legs up to 31 deg for a 10 deg arm "
                         "perturbation because every output reads every input.")
+    p.add_argument("--part_in", choices=["wide", "tight"], default="wide",
+                   help="--arch parts: 'tight' cuts the torso at the shoulders so the "
+                        "clavicles and head reach the arms only, not the legs")
+    p.add_argument("--fuse", action="store_true",
+                   help="--arch parts: add a correction head over the assembled 23 angles")
     p.add_argument("--blocks", type=int, default=4, help="residual blocks when --arch res")
     p.add_argument("--dropout", type=float, default=0.1, help="inside residual blocks")
     p.add_argument("--width", type=int, default=512)
@@ -357,8 +418,9 @@ def main():
                     "--width", str(args.width), "--batch", str(args.batch),
                     "--noise", str(args.noise), "--test_clips", str(args.test_clips),
                     "--arch", args.arch, "--blocks", str(args.blocks),
-                    "--dropout", str(args.dropout)]
-                   + (["--aux_t14"] if args.aux_t14 else []),
+                    "--dropout", str(args.dropout), "--part_in", args.part_in]
+                   + (["--aux_t14"] if args.aux_t14 else [])
+                   + (["--fuse"] if args.fuse else []),
                    cwd=_HERE, check=True)
 
 

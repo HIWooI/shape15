@@ -107,7 +107,17 @@ soma-retargeter를 PR#1 → PR#3으로 올린 뒤 다시 생성 중. 구 라벨�
 - [x] **residual + LayerNorm** — `distill.py --arch res`로 편입 완료.
   새 라벨에서 재확인: plain 14.94° → **res 13.97°**
 - [ ] **왼무릎 비대칭** — 우리 IK의 결함. `test_apose.py`에서 좌 22.3° vs 우 0.0°
-- [x] **K1 MLP 최종** → `models/k1_retarget_mlp_res.pt` **10.71°** (IK 26.75° 대비 −16.0°)
+- [x] **K1 MLP 최종** → `models/k1_retarget_tight.pt` **9.01°** (IK 26.75° 대비 −17.7°).
+  부위별 전문가 + 몸통을 어깨에서 절단(`--arch parts --part_in tight`). 사다리:
+  IK 26.75 → plain 14.94 → res 13.97 → +interp합성 10.71 → +mirror 10.21 →
+  부위별 9.14 → **몸통절단 9.01**
+- [x] **팔→다리 누설** — 원인은 팔 입력이 아니라 **몸통 입력**이었다. torso 13관절에
+  쇄골(11,39)·머리(4-10)가 섞여 있어 팔을 들면 다리 전문가 입력이 움직였다. 척추만
+  남기니 다리 전문가 입력 66→39차원인데 오차 5.93→5.69°, 프레임간 떨림 −16%.
+  측정은 `data/legstatic_test_k1.npz`(다리 완전 고정)로, 확인은 `outputs/tight_split.mp4`로.
+- [ ] **남은 다리 떨림** — tight 3.946° vs 교사 2.546°. 다리고정 학습데이터를 넣으면
+  3.474°까지 내려가지만 홀드아웃을 0.6° 판다(`models/k1_retarget_tight_legstatic.pt`).
+  떨림이 정확도보다 중요해지면 교체.
 - [ ] **K1 kp2d 학생** — denoiser+FK를 잘라 ~30 Hz. G1에서 MLP 11.48° vs kp2d 15.56°
   (−4.1°). K1은 출발점이 더 어려워 손실이 클 것이므로, **속도가 실제로 필요할 때만**
 

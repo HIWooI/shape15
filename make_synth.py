@@ -50,6 +50,12 @@ def main():
                         "this reaches the hard region without inventing impossible poses")
     p.add_argument("--bias_power", type=float, default=3.0,
                    help="how hard to skew toward extreme frames (1 = mild, 3 = strong)")
+    p.add_argument("--fix", nargs="*", choices=["leg", "arm", "torso"], default=[],
+                   help="hold these chains still for a whole clip, sampled once from a "
+                        "real pose, and vary only the rest. `--fix leg` gives upper-body "
+                        "motion over a planted stance — a configuration no real clip in "
+                        "this set contains (they are all dance and taekwondo, where the "
+                        "legs never stop) and the one the live demo is judged on.")
     p.add_argument("--fps", type=float, default=30.0)
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
@@ -68,6 +74,15 @@ def main():
     # identities: reuse real ones per clip, so the teacher's skeleton stays human-shaped
     ident_pool = np.unique(d["p_identity_coeffs"], axis=0)
     scale_pool = np.unique(d["p_scale_params"], axis=0)
+
+    # which body_pose axes each chain owns (fixture: derived from PARENTS_77)
+    import os
+    _here = os.path.dirname(os.path.abspath(__file__))
+    part = np.load(os.path.join(_here, "fixtures/soma_part77.npy")).astype(str)[1:]
+    axis_part = np.repeat(part, 3)
+    fixed_axes = np.where(np.isin(axis_part, args.fix))[0] if args.fix else np.array([], int)
+    if len(fixed_axes):
+        print(f"holding {args.fix} still: {len(fixed_axes)} of {len(axis_part)} axes")
 
     # per-frame sampling weight over the real poses
     pick = None
@@ -105,6 +120,10 @@ def main():
             b = bp[draw(nkf)]
             w = rng.uniform(0.0, args.blend, (nkf, 1))
             kf = a * (1 - w) + b * w
+        if len(fixed_axes):
+            # one stance for the whole clip, taken from a real frame so it is a pose a
+            # body actually held
+            kf[:, fixed_axes] = bp[rng.integers(len(bp))][fixed_axes]
         # cosine interpolation between keyframes: C1-smooth, no overshoot
         t = np.arange(n) / kf_gap
         i0 = t.astype(int)

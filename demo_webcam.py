@@ -317,6 +317,8 @@ class _PartExperts(torch.nn.Module):
         self.ndof = ndof
         self.nets, self.idx = torch.nn.ModuleDict(), {}
         for name, p in ck["parts"].items():
+            if name == "_fuse":
+                continue
             w, nb = ck["width"], ck.get("blocks", 4)
             net = torch.nn.Sequential(
                 torch.nn.Linear(len(p["in"]), w), *[_ResBlock(w) for _ in range(nb)],
@@ -331,11 +333,26 @@ class _PartExperts(torch.nn.Module):
                 torch.tensor(np.asarray(p["sd"]), dtype=torch.float32),
             )
 
+        f = ck["parts"].get("_fuse")
+        if f is not None:
+            self.fuse = torch.nn.Sequential(
+                torch.nn.Linear(ndof, 256), torch.nn.GELU(),
+                torch.nn.Linear(256, 256), torch.nn.GELU(),
+                torch.nn.Linear(256, ndof))
+            self.fuse.load_state_dict(f["state"])
+            self.fuse.eval()
+            self.fmu = torch.tensor(np.asarray(f["mu"]), dtype=torch.float32)
+            self.fsd = torch.tensor(np.asarray(f["sd"]), dtype=torch.float32)
+        else:
+            self.fuse = None
+
     def forward(self, x):
         out = x.new_zeros(self.ndof)
         for name, net in self.nets.items():
             ci, co, mu, sd = self.idx[name]
             out[co] = net((x[ci] - mu) / sd)
+        if self.fuse is not None:
+            out = out + self.fuse((out - self.fmu) / self.fsd)
         return out
 
 

@@ -9,15 +9,19 @@ copy inside the project.
 |---|---|---|
 | `big4_g1.npz.perception.npz` | 9,396 / 15 clips | **the expensive one.** Streaming SOMA params + kp2d from 18 real videos (3 AV1 clips failed to decode). Robot-agnostic — every robot's labels are made from this. |
 | `big4_g1.npz` | 9,396 | + G1 teacher labels (29 DOF) |
+| `big4_k1.npz` | 9,396 | + K1 teacher labels (23 DOF), soma-retargeter PR#3 |
 | `synth.perception.npz` | 14,400 / 24 clips | synthetic SOMA trajectories from `make_synth.py`, no video involved |
 | `synth_g1.npz` | 14,400 | + G1 teacher labels |
+| `synth_interp*.npz` | 4,800 / 8 clips | `--mode interp --blend 0.6` — the synthetic set that actually helps |
+| `synth_legstatic*.npz` | 4,800 / 8 clips | `--fix leg`: a planted stance, upper body moves. Training data for leg wobble |
+| `legstatic_test*.npz` | 1,200 / 4 stances | **the leakage measurement.** Legs held exactly fixed, so any leg motion a model produces is leakage. Never train on this one |
 | `*_h264.mp4`, `dance.mp4` | — | source clips that needed transcoding (the AV1 originals in ~/Downloads do not decode here) |
 
 **Splits.** Every number in `PLAN.md` holds out the **last two clips** (16 `taeguk_1st`,
 17 `video.mov`, 4,697 frames) and trains on the other 13 (4,699 frames). Hold out by clip,
 never by frame — neighbouring frames of one clip are nearly identical.
 
-**K1 labels are absent on purpose.** The ones made before 2026-08-14 came from a
+**Nothing here predates 2026-08-14.** The K1 labels made before then came from a
 soma-retargeter config that broke the left leg on half the frames and were deleted; see
 the note at the top of `PLAN.md`. Regenerate with:
 
