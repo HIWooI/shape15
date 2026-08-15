@@ -74,10 +74,10 @@ GEM-X/.venv/bin/python make_synth.py data/big4_g1.npz.perception.npz \
 .venv-ik/bin/python distill.py data/x_k1.npz --features pose --width 1024 --arch res
 .venv-ik/bin/python make_offsets.py data/x_k1.npz
 
-# 배포 모델 재현 (부위별 전문가, 몸통을 어깨에서 절단)
+# 배포 모델 재현 (부위별 전문가, 다리는 다리 입력만)
 .venv-ik/bin/python distill.py data/big4_k1.npz --features pose --width 1024 \
-    --arch parts --part_in tight --extra data/synth_interp_k1.npz --mirror \
-    --model models/k1_retarget_tight.pt
+    --arch parts --part_in solo --extra data/synth_interp_k1.npz --mirror \
+    --model models/k1_retarget_solo.pt
 
 # 사람 / 교사 / 모델들 나란히 렌더 — 수치만 보고 결론 내리지 말 것
 GEM-X/.venv/bin/python render_labels.py data/legstatic_test_k1.npz outputs/x.mp4 \
@@ -89,7 +89,8 @@ GEM-X/.venv/bin/python render_labels.py data/legstatic_test_k1.npz outputs/x.mp4
 | 플래그 | 뜻 |
 |---|---|
 | `--part_in wide` | 다리 전문가가 torso 13관절 전부를 본다 (쇄골·머리 포함). 구 기본값 |
-| `--part_in tight` | 척추(1-3)만 다리에, 쇄골(11,39)·머리(4-10)는 팔·몸통에만. **현재 기본 모델** |
+| `--part_in tight` | 척추(1-3)만 다리에, 쇄골(11,39)·머리(4-10)는 팔·몸통에만 |
+| `--part_in solo` | 다리는 다리 관절만 본다. **골반 위 섭동에 다리 변화 0.000°** — 현재 기본 모델 |
 | `--fuse` | 조립된 23각도 위에 보정 헤드. 측정상 효과 없음(−0.02°), 기록용으로 유지 |
 
 ### 회귀 검사

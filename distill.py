@@ -173,7 +173,7 @@ def train(args):
     PART_IN = {"leg": ("leg", "torso"), "arm": ("arm", "torso"), "torso": ("torso",)}
     PART_OUT = {"leg": ("hip", "knee", "ankle"), "arm": ("shoulder", "elbow", "wrist"),
                 "torso": ("waist",)}
-    if args.part_in == "tight":
+    if args.part_in in ("tight", "solo"):
         # Cut the torso at the shoulders. "torso" lumps the spine in with the clavicles
         # (joints 11 and 39) and the head chain (4-10), and the clavicles rotate whenever
         # the arms move -- so with the wide split the leg expert has a live arm input even
@@ -185,6 +185,11 @@ def train(args):
         axis_part = np.repeat(fine, 3)
         PART_IN = {"leg": ("leg", "spine"), "arm": ("arm", "spine", "upper"),
                    "torso": ("spine", "upper")}
+        if args.part_in == "solo":
+            # Nothing above the pelvis reaches the legs at all. The spine still moves the
+            # legs in the teacher (a raised arm shifts the stance), so this gives that up
+            # on purpose in exchange for a leg pose that cannot be contaminated.
+            PART_IN["leg"] = ("leg",)
 
     class ResBlock(nn.Module):
         """Pre-norm residual MLP block.
@@ -391,9 +396,10 @@ def main():
                         "accuracy as one net (10.09 vs 10.13) with the leakage structurally "
                         "zero — a single net moves the legs up to 31 deg for a 10 deg arm "
                         "perturbation because every output reads every input.")
-    p.add_argument("--part_in", choices=["wide", "tight"], default="wide",
+    p.add_argument("--part_in", choices=["wide", "tight", "solo"], default="wide",
                    help="--arch parts: 'tight' cuts the torso at the shoulders so the "
-                        "clavicles and head reach the arms only, not the legs")
+                        "clavicles and head reach the arms only, not the legs; 'solo' also "
+                        "cuts the spine, so nothing above the pelvis reaches them")
     p.add_argument("--fuse", action="store_true",
                    help="--arch parts: add a correction head over the assembled 23 angles")
     p.add_argument("--blocks", type=int, default=4, help="residual blocks when --arch res")
