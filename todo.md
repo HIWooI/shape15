@@ -100,6 +100,7 @@ soma-retargeter를 PR#1 → PR#3으로 올린 뒤 다시 생성 중. 구 라벨�
 - [x] **blend 스윕** — 0.6이 최적: **14.26 → 10.79°**
 - [x] **양 확대는 역효과** — 8클립(1:1) 11.74° vs 24클립(3:1) 12.18°
 - [x] **부위별 전문가 구조** — 정확도 동등, 단 파라미터 32% 절감(엣지용 카드)
+- [x] **극단 자세 과표집** — 실패(10.79 → 15.50°). `--bias extreme`은 남겨두되 기본은 uniform
 
 ## 4. K1 정확도 올리기
 
@@ -114,7 +115,8 @@ soma-retargeter를 PR#1 → PR#3으로 올린 뒤 다시 생성 중. 구 라벨�
 
 **지금 동작하는 단계.** 남은 건 K1 모델 배선과 화면 품질.
 
-- [ ] K1 MLP 라이브 확인 (체크포인트가 로봇/DOF를 담고 있어 코드 변경 불필요)
+- [x] **K1 MLP 라이브 확인 완료** — 25~46 FPS, 자세 추종 확인.
+  (`build_student()`로 res 체크포인트 로딩 버그 수정)
   ```
   GEM-X/.venv/bin/python demo_webcam.py --flip --robot k1 --stream 8080 \
       --no_imgfeat --mlp models/k1_retarget_mlp.pt

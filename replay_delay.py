@@ -95,10 +95,7 @@ def main():
     mlp = None
     if args.mlp:
         ck = torch.load(str(_CWD / args.mlp), map_location="cpu", weights_only=False)
-        w = ck["width"]
-        mlp_net = torch.nn.Sequential(
-            torch.nn.Linear(len(ck["mu"]), w), torch.nn.GELU(),
-            torch.nn.Linear(w, w), torch.nn.GELU(), torch.nn.Linear(w, len(ck["names"])))
+        mlp_net = D.build_student(ck, len(ck["names"]))
         mlp_net.load_state_dict(ck["state"])
         mlp_net.eval()
         mmu = torch.tensor(np.asarray(ck["mu"]), dtype=torch.float32)

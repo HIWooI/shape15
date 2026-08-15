@@ -42,6 +42,14 @@ def main():
                         "joint limits")
     p.add_argument("--blend", type=float, default=0.35,
                    help="interp mode: how far a keyframe may drift toward another real pose")
+    p.add_argument("--bias", choices=["uniform", "extreme"], default="uniform",
+                   help="interp mode: which real frames to draw keyframes from. extreme "
+                        "oversamples the poses the student is worst at — hands above the "
+                        "shoulders (5.3 deg -> 21.4), feet wide apart (5.1 -> 20.6), arms "
+                        "fully extended (6.2 -> 19.7). Blending stays on the manifold, so "
+                        "this reaches the hard region without inventing impossible poses")
+    p.add_argument("--bias_power", type=float, default=3.0,
+                   help="how hard to skew toward extreme frames (1 = mild, 3 = strong)")
     p.add_argument("--fps", type=float, default=30.0)
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
@@ -61,6 +69,24 @@ def main():
     ident_pool = np.unique(d["p_identity_coeffs"], axis=0)
     scale_pool = np.unique(d["p_scale_params"], axis=0)
 
+    # per-frame sampling weight over the real poses
+    pick = None
+    if args.mode == "interp" and args.bias == "extreme":
+        if "joints" not in d.files:
+            raise SystemExit("--bias extreme needs the perception npz's `joints`")
+        j = d["joints"]                     # (N,14,3) camera frame: x right, y down, z fwd
+        sh = (j[:, 2] + j[:, 5]) / 2        # shoulders
+        hand_up = (sh[:, 1] - (j[:, 4, 1] + j[:, 7, 1]) / 2)      # hands above shoulders
+        foot_gap = np.linalg.norm(j[:, 10] - j[:, 13], axis=1)     # stance width
+        arm_ext = (np.linalg.norm(j[:, 4] - j[:, 2], axis=1)
+                   + np.linalg.norm(j[:, 7] - j[:, 5], axis=1)) / 2
+        z = lambda v: (v - v.mean()) / (v.std() + 1e-9)
+        score = np.maximum(z(hand_up), 0) + np.maximum(z(foot_gap), 0) + np.maximum(z(arm_ext), 0)
+        w = (score + 0.05) ** args.bias_power
+        pick = w / w.sum()
+        top = np.argsort(-pick)[: len(pick) // 10]
+        print(f"extreme bias: top 10% of frames carry {pick[top].sum() * 100:.0f}% of the weight")
+
     kf_gap = max(2, int(args.keyframe_s * args.fps))
     n = args.frames
     outs = {k: [] for k in ("p_body_pose", "p_global_orient", "p_transl",
@@ -73,8 +99,10 @@ def main():
         else:
             # keyframes are real poses nudged toward other real poses: novel combinations,
             # but every one is a blend of things a body actually did
-            a = bp[rng.integers(len(bp), size=nkf)]
-            b = bp[rng.integers(len(bp), size=nkf)]
+            draw = (lambda k: rng.integers(len(bp), size=k)) if pick is None else \
+                   (lambda k: rng.choice(len(bp), size=k, p=pick))
+            a = bp[draw(nkf)]
+            b = bp[draw(nkf)]
             w = rng.uniform(0.0, args.blend, (nkf, 1))
             kf = a * (1 - w) + b * w
         # cosine interpolation between keyframes: C1-smooth, no overshoot

@@ -267,6 +267,36 @@ def capture_joint_rotations(soma):
     return stash
 
 
+class _ResBlock(torch.nn.Module):
+    """Pre-norm residual block, matching distill.py --arch res."""
+
+    def __init__(self, w, drop=0.1):
+        super().__init__()
+        self.n = torch.nn.LayerNorm(w)
+        self.f = torch.nn.Sequential(torch.nn.Linear(w, w), torch.nn.GELU(),
+                                     torch.nn.Dropout(drop), torch.nn.Linear(w, w))
+
+    def forward(self, x):
+        return x + self.f(self.n(x))
+
+
+def build_student(ck, ndof, extra_out=0):
+    """Rebuild a distill.py checkpoint's network from the shape it recorded.
+
+    The checkpoint carries `arch`/`blocks`, so a plain and a residual model both load
+    through the same call — older checkpoints have neither and default to plain.
+    """
+    w, nb = ck["width"], ck.get("blocks", 4)
+    n_out = ndof + extra_out
+    if str(ck.get("arch", "plain")) == "plain":
+        return torch.nn.Sequential(
+            torch.nn.Linear(len(ck["mu"]), w), torch.nn.GELU(),
+            torch.nn.Linear(w, w), torch.nn.GELU(), torch.nn.Linear(w, n_out))
+    return torch.nn.Sequential(
+        torch.nn.Linear(len(ck["mu"]), w), *[_ResBlock(w) for _ in range(nb)],
+        torch.nn.LayerNorm(w), torch.nn.Linear(w, n_out))
+
+
 def freeze_identity(soma):
     """Compute the person's rest shape once instead of every frame.
 
@@ -626,10 +656,7 @@ def main():
         # perception for the GPU, same reasoning as the IK worker
         ck = torch.load(HERE / args.mlp, map_location="cpu", weights_only=False)
         assert len(ck["names"]) == ik_ndof, f"model is for {len(ck['names'])} DOF, robot has {ik_ndof}"
-        w = ck["width"]
-        mlp_net = torch.nn.Sequential(
-            torch.nn.Linear(len(ck["mu"]), w), torch.nn.GELU(),
-            torch.nn.Linear(w, w), torch.nn.GELU(), torch.nn.Linear(w, ik_ndof))
+        mlp_net = build_student(ck, ik_ndof)
         mlp_net.load_state_dict(ck["state"])
         mlp_net.eval()
         mlp_mu = torch.tensor(np.asarray(ck["mu"]), dtype=torch.float32)
