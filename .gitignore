@@ -17,3 +17,6 @@ outputs/
 
 # local tool settings
 .claude/settings.local.json
+
+# live session logs
+logs/

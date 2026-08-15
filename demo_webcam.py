@@ -280,6 +280,26 @@ class _ResBlock(torch.nn.Module):
         return x + self.f(self.n(x))
 
 
+def _log_summary(path, rows, frames, secs, n_calib, n_drop):
+    """What the session actually did, in the terms that matter for a freeze."""
+    if not rows:
+        print(f"[log] no frames recorded -> {path}")
+        return
+    a = np.array(rows)                       # gap, loop, vitpose, predict, fk
+    gap = a[1:, 0] if len(a) > 1 else a[:, 0]
+    pc = lambda v, q: float(np.percentile(v, q))
+    print(f"\n[log] {frames} frames in {secs:.0f} s ({frames / max(secs, 1e-6):.1f} FPS)")
+    print(f"  frame gap ms : median {np.median(gap):6.1f}  p99 {pc(gap, 99):6.1f}  "
+          f"max {gap.max():6.1f}   <- 멈춤은 이 값으로 판정한다")
+    print(f"  loop ms      : median {np.median(a[:, 1]):6.1f}  p99 {pc(a[:, 1], 99):6.1f}")
+    for k, col in (("vitpose", 2), ("predict", 3), ("fk", 4)):
+        v = a[a[:, col] > 0, col]
+        if len(v):
+            print(f"  {k:12s} : median {np.median(v):6.1f}  p99 {pc(v, 99):6.1f}")
+    print(f"  calibrations {n_calib}, frames the worker could not take {n_drop}")
+    print(f"  per-frame rows -> {path}")
+
+
 def build_student(ck, ndof, extra_out=0):
     """Rebuild a distill.py checkpoint's network from the shape it recorded.
 
@@ -555,6 +575,11 @@ def main():
                         "angles come from this distill.py checkpoint reading SOMA's "
                         "body_pose; the worker only fits the base for display. "
                         "11.5 deg vs soma-retargeter where the IK reads 19.6.")
+    p.add_argument("--log", metavar="CSV",
+                   help="record one row per frame (wall time, frame gap, per-stage ms, "
+                        "tracking state, whether the worker took the frame) and print a "
+                        "session summary on exit. The frame gap is the column that "
+                        "diagnoses a freeze — throughput does not.")
     p.add_argument("--kp2d_mlp", metavar="PT",
                    help="the stage-cut student: VitPose 2D window -> joint angles + the "
                         "14 targets, skipping the GEM denoiser and SOMA FK entirely. "
@@ -670,112 +695,148 @@ def main():
             return mlp_net((x - mlp_mu) / mlp_sd).numpy().astype("<f4")
 
     calib_left, calib_send = 0, False  # prompt frames left; request still to reach the worker
-    while not cam.stop:
-        frame = cam.read()
-        t0 = time.time()
-        if recalibrate[0]:
-            recalibrate[0] = False
-            if soma is not None:
-                soma._identity_frozen = False  # next FK re-measures the person's rest shape
-            calib_left, calib_send = CALIB_FRAMES, True
+    logf, log_rows, t_prev, n_calib, n_drop = None, [], None, 0, 0
+    if args.log:
+        logf = open(HERE / args.log, "w", buffering=1)
+        logf.write("frame,wall,gap_ms,vitpose_ms,predict_ms,fk_ms,retarget_ms,loop_ms,"
+                   "tracked,sent,calib\n")
+    t_start = time.time()
+    try:
+      while not cam.stop:
+          frame = cam.read()
+          t0 = time.time()
+          gap_ms = 0.0 if t_prev is None else (t0 - t_prev) * 1000.0
+          t_prev = t0
+          st = {"vitpose": 0.0, "predict": 0.0, "fk": 0.0, "retarget": 0.0}
+          sent_ok, tracked = 0, 1
+          if recalibrate[0]:
+              recalibrate[0] = False
+              n_calib += 1
+              if soma is not None:
+                  soma._identity_frozen = False  # next FK re-measures the person's rest shape
+              calib_left, calib_send = CALIB_FRAMES, True
 
-        with torch.autocast("cuda", dtype=torch.float16):
-            kp2d = vitpose.extract(frame[None], bbx[None], path_type="np", batch_size=1)[0]
-        kp2d_win.append(kp2d.cuda())
-        bbx_win.append(bbx.cuda())
-        if worker is not None:
-            token = worker.submit(frame, bbx)  # returns the latest finished token
-            if token is not None:
-                tok_win.append(token)
-        bbx = bbox_from_kps(kp2d, W, H)
-        if bbx is None:  # lost the person, re-detect from scratch
-            # one pass, not three: re-detection happens mid-stream and a 1.7 s stall is
-            # worse than a slightly worse box, which the next frames correct anyway
-            bbx, xy3d = bootstrap_bbox(vitpose, frame, W, H, rounds=1), None
-            kp2d_win.clear()
-            bbx_win.clear()
-            tok_win.clear()
-            if worker is not None:
-                worker.reset()
+          _ts = time.time()
+          with torch.autocast("cuda", dtype=torch.float16):
+              kp2d = vitpose.extract(frame[None], bbx[None], path_type="np", batch_size=1)[0]
+          st["vitpose"] = (time.time() - _ts) * 1000.0
+          kp2d_win.append(kp2d.cuda())
+          bbx_win.append(bbx.cuda())
+          if worker is not None:
+              token = worker.submit(frame, bbx)  # returns the latest finished token
+              if token is not None:
+                  tok_win.append(token)
+          bbx = bbox_from_kps(kp2d, W, H)
+          if bbx is None:
+              tracked = 0
+          if bbx is None:  # lost the person, re-detect from scratch
+              # one pass, not three: re-detection happens mid-stream and a 1.7 s stall is
+              # worse than a slightly worse box, which the next frames correct anyway
+              bbx, xy3d = bootstrap_bbox(vitpose, frame, W, H, rounds=1), None
+              kp2d_win.clear()
+              bbx_win.clear()
+              tok_win.clear()
+              if worker is not None:
+                  worker.reset()
 
-        if kp2d_net is not None and ik is not None:
-            # stage-cut path: no denoiser, no FK — the student answers from the 2D window
-            q_pred, t14_pred = kp2d_student(kp2d.numpy())
-            conf = kp2d[SOMA_IDX, 2].numpy().astype("<f4")
-            if calib_send:
-                conf[0] = -abs(conf[0])  # same sign-bit calibration request as below
-            payload = (t14_pred.tobytes() + conf.tobytes()
-                       + np.zeros((14, 3, 3), "<f4").tobytes() + q_pred.tobytes())
-            sent = ik.submit(payload)
-            calib_send = calib_send and not sent
-        if model is not None and len(kp2d_win) >= args.min_window and i % args.infer_every == 0:
-            # frames before the first token arrived reuse it, same as any held token
-            f_img = None
-            if tok_win:
-                pad = [tok_win[0]] * (len(kp2d_win) - len(tok_win))
-                f_img = torch.stack(pad + list(tok_win))
-            pred = model.predict(
-                make_data(kp2d_win, bbx_win, K, f_img), static_cam=True, postproc=False
-            )
-            xy3d, joints3d, jrot = project_last_frame(model, pred, K)
-            if view3d is not None:
-                view3d.update(joints3d)
-            if ik is not None:
-                # camera-frame joints; the worker converts to the robot world and solves
-                conf = kp2d[SOMA_IDX, 2].numpy().astype("<f4")
-                if calib_send:
-                    # Ask the worker to re-measure scales and floor. The sign of the first
-                    # confidence carries the request, so the fixed-size protocol is
-                    # unchanged and the value itself survives; the worker takes abs().
-                    conf[0] = -abs(conf[0])  # the worker reads the sign bit, so -0.0 counts
-                rot = (jrot if (args.soma_rot and jrot is not None)
-                       else np.zeros((14, 3, 3), np.float32))
-                payload = (joints3d[SOMA_IDX].astype("<f4").tobytes()
-                           + conf.tobytes() + rot.astype("<f4").tobytes())
-                if mlp is not None:
-                    with torch.no_grad():
-                        bp = pred["body_params_incam"]["body_pose"][-1].reshape(-1).float().cpu()
-                        # kp2d confidences, not `conf` — that copy's sign bit doubles as
-                        # the calibration signal and must not reach the network
-                        payload += mlp(bp, kp2d[SOMA_IDX, 2].numpy()).tobytes()
-                # Retry until a submit lands, then stop. IKLink drops frames when the
-                # worker is behind, so the request can miss; but sending it for a whole
-                # window overshoots the worker's own 15-frame measurement and kicks off a
-                # second calibration as soon as the first one finishes.
-                sent = ik.submit(payload)
-                calib_send = calib_send and not sent
+          if kp2d_net is not None and ik is not None:
+              # stage-cut path: no denoiser, no FK — the student answers from the 2D window
+              q_pred, t14_pred = kp2d_student(kp2d.numpy())
+              conf = kp2d[SOMA_IDX, 2].numpy().astype("<f4")
+              if calib_send:
+                  conf[0] = -abs(conf[0])  # same sign-bit calibration request as below
+              payload = (t14_pred.tobytes() + conf.tobytes()
+                         + np.zeros((14, 3, 3), "<f4").tobytes() + q_pred.tobytes())
+              sent = ik.submit(payload)
+              sent_ok = int(sent); n_drop += (not sent)
+              calib_send = calib_send and not sent
+          if model is not None and len(kp2d_win) >= args.min_window and i % args.infer_every == 0:
+              # frames before the first token arrived reuse it, same as any held token
+              f_img = None
+              if tok_win:
+                  pad = [tok_win[0]] * (len(kp2d_win) - len(tok_win))
+                  f_img = torch.stack(pad + list(tok_win))
+              _ts = time.time()
+              pred = model.predict(
+                  make_data(kp2d_win, bbx_win, K, f_img), static_cam=True, postproc=False
+              )
+              st["predict"] = (time.time() - _ts) * 1000.0
+              _ts = time.time()
+              xy3d, joints3d, jrot = project_last_frame(model, pred, K)
+              st["fk"] = (time.time() - _ts) * 1000.0
+              if view3d is not None:
+                  view3d.update(joints3d)
+              if ik is not None:
+                  # camera-frame joints; the worker converts to the robot world and solves
+                  conf = kp2d[SOMA_IDX, 2].numpy().astype("<f4")
+                  if calib_send:
+                      # Ask the worker to re-measure scales and floor. The sign of the first
+                      # confidence carries the request, so the fixed-size protocol is
+                      # unchanged and the value itself survives; the worker takes abs().
+                      conf[0] = -abs(conf[0])  # the worker reads the sign bit, so -0.0 counts
+                  _ts = time.time()
+                  rot = (jrot if (args.soma_rot and jrot is not None)
+                         else np.zeros((14, 3, 3), np.float32))
+                  payload = (joints3d[SOMA_IDX].astype("<f4").tobytes()
+                             + conf.tobytes() + rot.astype("<f4").tobytes())
+                  if mlp is not None:
+                      with torch.no_grad():
+                          bp = pred["body_params_incam"]["body_pose"][-1].reshape(-1).float().cpu()
+                          # kp2d confidences, not `conf` — that copy's sign bit doubles as
+                          # the calibration signal and must not reach the network
+                          payload += mlp(bp, kp2d[SOMA_IDX, 2].numpy()).tobytes()
+                  # Retry until a submit lands, then stop. IKLink drops frames when the
+                  # worker is behind, so the request can miss; but sending it for a whole
+                  # window overshoots the worker's own 15-frame measurement and kicks off a
+                  # second calibration as soon as the first one finishes.
+                  sent = ik.submit(payload)
+                  sent_ok = int(sent)
+                  n_drop += (not sent)
+                  st["retarget"] = (time.time() - _ts) * 1000.0
+                  calib_send = calib_send and not sent
 
-        if xy3d is not None:
-            frame = draw_skeleton(frame, xy3d)
-        else:  # warm-up / re-detect: show the raw 2D keypoints so the view is never blank
-            frame = draw_skeleton(frame, kp2d[:, :2].numpy(), conf=kp2d[:, 2].numpy())
+          if xy3d is not None:
+              frame = draw_skeleton(frame, xy3d)
+          else:  # warm-up / re-detect: show the raw 2D keypoints so the view is never blank
+              frame = draw_skeleton(frame, kp2d[:, :2].numpy(), conf=kp2d[:, 2].numpy())
 
-        fps = 0.9 * fps + 0.1 / max(time.time() - t0, 1e-6)
-        cv2.putText(
-            frame, f"{fps:5.1f} FPS", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2
-        )
-        if i % 30 == 0:
-            print(f"{fps:5.1f} FPS", flush=True)
-        shown = np.ascontiguousarray(frame[:, ::-1]) if args.flip else frame
-        if calib_left > 0:  # after the flip, or the prompt comes out mirrored
-            calib_left -= 1
-            cv2.putText(shown, "CALIBRATING - stand in a T-pose", (10, H - 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2)
-        if stream is not None:
-            stream.put(shown)
-        else:
-            # local window: the Calibrate button lives on the streamed page, so bind the
-            # same request to a key here
-            cv2.putText(shown, "c: calibrate   q: quit", (10, H - 12),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1, cv2.LINE_AA)
-            cv2.imshow("GEM-X SOMA skeleton", shown)
-            k = cv2.waitKey(1) & 0xFF
-            if k == ord("q"):
-                break
-            if k == ord("c"):
-                recalibrate[0] = True
-        i += 1
+          fps = 0.9 * fps + 0.1 / max(time.time() - t0, 1e-6)
+          cv2.putText(
+              frame, f"{fps:5.1f} FPS", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2
+          )
+          if i % 30 == 0:
+              print(f"{fps:5.1f} FPS", flush=True)
+          shown = np.ascontiguousarray(frame[:, ::-1]) if args.flip else frame
+          if calib_left > 0:  # after the flip, or the prompt comes out mirrored
+              calib_left -= 1
+              cv2.putText(shown, "CALIBRATING - stand in a T-pose", (10, H - 20),
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2)
+          if stream is not None:
+              stream.put(shown)
+          else:
+              # local window: the Calibrate button lives on the streamed page, so bind the
+              # same request to a key here
+              cv2.putText(shown, "c: calibrate   q: quit", (10, H - 12),
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1, cv2.LINE_AA)
+              cv2.imshow("GEM-X SOMA skeleton", shown)
+              k = cv2.waitKey(1) & 0xFF
+              if k == ord("q"):
+                  break
+              if k == ord("c"):
+                  recalibrate[0] = True
+          if logf is not None:
+              loop_ms = (time.time() - t0) * 1000.0
+              log_rows.append((gap_ms, loop_ms, st["vitpose"], st["predict"], st["fk"]))
+              logf.write(f"{i},{t0 - t_start:.3f},{gap_ms:.1f},{st['vitpose']:.1f},"
+                         f"{st['predict']:.1f},{st['fk']:.1f},{st['retarget']:.1f},"
+                         f"{loop_ms:.1f},{tracked},{sent_ok},{1 if calib_left else 0}\n")
+          i += 1
 
+    except KeyboardInterrupt:
+        print("\n[log] interrupted", flush=True)
+    if logf is not None:
+        logf.close()
+        _log_summary(args.log, log_rows, i, time.time() - t_start, n_calib, n_drop)
     cam.stop = True
     if ik is not None:
         ik.close()
