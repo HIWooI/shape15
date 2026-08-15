@@ -33,7 +33,15 @@ def main():
     p.add_argument("--keyframe_s", type=float, default=0.7,
                    help="seconds between pose keyframes (speed of the synthetic motion)")
     p.add_argument("--margin", type=float, default=1.5,
-                   help="widen the observed per-axis range by this factor")
+                   help="box mode: widen the observed per-axis range by this factor")
+    p.add_argument("--mode", choices=["box", "interp"], default="box",
+                   help="box: keyframes uniform in a per-axis range. interp: keyframes are "
+                        "real poses (optionally blended with a neighbour), which stays on "
+                        "the human manifold — box at margin 1.5 made 41%% of K1 labels "
+                        "pathological because the teacher pushes impossible poses into "
+                        "joint limits")
+    p.add_argument("--blend", type=float, default=0.35,
+                   help="interp mode: how far a keyframe may drift toward another real pose")
     p.add_argument("--fps", type=float, default=30.0)
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
@@ -60,7 +68,15 @@ def main():
     clip_idx = []
     for ci in range(args.clips):
         nkf = n // kf_gap + 2
-        kf = rng.uniform(lo, hi, (nkf, bp.shape[1]))
+        if args.mode == "box":
+            kf = rng.uniform(lo, hi, (nkf, bp.shape[1]))
+        else:
+            # keyframes are real poses nudged toward other real poses: novel combinations,
+            # but every one is a blend of things a body actually did
+            a = bp[rng.integers(len(bp), size=nkf)]
+            b = bp[rng.integers(len(bp), size=nkf)]
+            w = rng.uniform(0.0, args.blend, (nkf, 1))
+            kf = a * (1 - w) + b * w
         # cosine interpolation between keyframes: C1-smooth, no overshoot
         t = np.arange(n) / kf_gap
         i0 = t.astype(int)
