@@ -20,3 +20,4 @@ outputs/
 
 # live session logs
 logs/
+.claude/worktrees/
