@@ -671,7 +671,12 @@ class RawLog:
 class Camera:
     """Capture thread keeping only the newest frame, so inference never lags behind."""
 
-    def __init__(self, index):
+    def __init__(self, index, unmirror=False):
+        # Some webcams hand out a mirrored image by default. That is harmless for a
+        # preview and wrong for everything else here: the operator's left arm arrives as
+        # their right, so every retargeted clip is a mirror of the performance. Undoing it
+        # at the source means perception, the retarget and the saved raw all agree.
+        self.unmirror = unmirror
         self.index = index
         self.cap = cv2.VideoCapture(index)
         assert self.cap.isOpened(), f"cannot open camera {index}"
@@ -684,6 +689,8 @@ class Camera:
         misses = 0
         while not self.stop:
             ok, frame = self.cap.read()
+            if ok and self.unmirror:
+                frame = np.ascontiguousarray(frame[:, ::-1])
             if not ok:
                 # a USB hiccup used to end the demo outright; reopen instead
                 misses += 1
@@ -745,6 +752,10 @@ def main():
                         "tracking state, whether the worker took the frame) and print a "
                         "session summary on exit. The frame gap is the column that "
                         "diagnoses a freeze — throughput does not.")
+    p.add_argument("--unmirror", action="store_true",
+                   help="the camera delivers a mirrored image; flip it back before "
+                        "anything reads it. Check by finding readable text in the scene: "
+                        "if signage reads backwards in rgb.mp4, this is needed.")
     p.add_argument("--save_raw", metavar="DIR",
                    help="keep the take's raw inputs: rgb.mp4 as the camera saw it, and "
                         "soma.npz with the 3D skeleton, confidences, joint rotations and "
@@ -788,7 +799,7 @@ def main():
 
         worker = TokenWorker(SAM3DBExtractor(device="cuda:0"))
 
-    cam = Camera(args.camera)
+    cam = Camera(args.camera, unmirror=args.unmirror)
     while cam.read() is None:
         time.sleep(0.05)
     H, W = cam.read().shape[:2]

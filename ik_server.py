@@ -127,6 +127,11 @@ def main():
     # view. Note this mirrors the joint angles sent downstream too; for real teleoperation
     # (as opposed to a mirror demo) leave it off.
     mirror = "--mirror" in sys.argv
+    # --free_root: keep the operator's horizontal motion instead of pinning the pelvis to
+    # the origin every frame. Required for a policy reference; optional for the display,
+    # where a wandering robot is just harder to look at.
+    free_root = "--free_root" in sys.argv
+    root_origin = None
     # --mlp: perception appends network-predicted joint angles to each frame; use them
     # instead of solving, and only fit the free base so the display stands in place.
     use_mlp = "--mlp" in sys.argv
@@ -156,9 +161,16 @@ def main():
             pass
 
     q, T = jnp.zeros(ndof), jaxlie.SE3.identity()
+    # --stamped: the frame carries its own capture time as a trailing float. Offline
+    # replay runs faster than the take was recorded, so the wall clock would compress a
+    # two-minute performance into seconds and the 50 Hz resampling would keep almost
+    # nothing of it. Live runs leave this off and the wall clock is the right answer.
+    stamped = "--stamped" in sys.argv
     n_in = (14 * 3 + 14 + 14 * 9) * 4  # xyz, confidence, and joint rotation
     if use_mlp:
         n_in += ndof * 4  # plus the network's joint angles
+    if stamped:
+        n_in += 4
     scales, calib, floor, recalibrating = None, [], 0.0, False
     CALIB_FRAMES = 15  # ~1 s at 15 Hz
 
@@ -174,6 +186,9 @@ def main():
             break
         t_in = time.time()
         raw = np.frombuffer(buf, dtype="<f4")
+        t_frame = float(raw[-1]) if stamped else None
+        if stamped:
+            raw = raw[:-1]
         mlp_q = raw[-ndof:].copy() if use_mlp else None
         conf = raw[42:56].copy()
         if np.signbit(conf[0]):
@@ -185,6 +200,7 @@ def main():
             print("[calib] re-measuring scales and floor", file=sys.stderr)
             # the current scales keep driving the robot until the new ones replace them
             calib, recalibrating = [], True
+            root_origin = None  # re-anchor where the operator is standing now
             if mc is not None:
                 mc.reset()  # the clip starts at Calibrate, not at process start
         jrot = raw[56:182].reshape(14, 3, 3).copy()  # SOMA joint world rotations, camera frame
@@ -192,7 +208,17 @@ def main():
         if mirror:
             pts[..., 0] *= -1.0  # camera-frame x is the operator's left-right
         targets = cam_to_world(pts).copy()
-        targets[..., :2] -= targets[:, :1, :2]  # keep the robot near the origin
+        if free_root:
+            # Anchor once, at Calibrate, instead of every frame. Pinning the pelvis to the
+            # origin each frame keeps the display tidy but deletes the operator's weight
+            # shift, and a reference that lifts a foot 0.35 m while the pelvis never leaves
+            # centre is one no robot can execute — measured as the left foot running 0.25 m
+            # away from the policy's own foot until the run terminated.
+            if root_origin is None:
+                root_origin = targets[0, 0, :2].copy()
+            targets[..., :2] -= root_origin
+        else:
+            targets[..., :2] -= targets[:, :1, :2]  # keep the robot near the origin
         if calib is not None:
             # Calibrate over a window, not one frame: bone lengths from a single pose
             # estimate are noisy, and they hold until the operator asks for new ones.
@@ -268,7 +294,8 @@ def main():
             # quaternion stored xyzw), so carry the IK's own base transform along
             root = np.concatenate([np.asarray(T.translation()),
                                    np.asarray(T.rotation().wxyz)[[1, 2, 3, 0]]])
-            mc.push(_t.time(), np.asarray(q_out), R, root.astype(np.float32))
+            mc.push(_t.time() if t_frame is None else t_frame,
+                    np.asarray(q_out), R, root.astype(np.float32))
         out = np.concatenate([[(time.time() - t0) * 1000], np.asarray(q_out)]).astype("<f4")
         sys.stdout.buffer.write(out.tobytes())
         sys.stdout.buffer.flush()
