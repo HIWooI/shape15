@@ -54,6 +54,9 @@ def main():
                    help="have the worker print its own per-stage medians on exit")
     p.add_argument("--profile", action="store_true", help="break the loop down by stage")
     p.add_argument("--motion_command", help="write the 50 Hz policy reference to this .npz")
+    p.add_argument("--dense", action="store_true",
+                   help="process every frame instead of simulating the live loop's drops. "
+                        "Use when producing a reference clip, not when measuring delay.")
     p.add_argument("--soma_rot", action="store_true",
                    help="use SOMA's joint rotations as orientation targets (unverified: it "
                         "moves the twist joints a lot but has not been shown to be better)")
@@ -114,7 +117,7 @@ def main():
 
         ik_ndof = {"g1": 29, "k1": 23}[args.ik]
         cmd = ([".venv-ik/bin/python", "ik_server.py", "--robot", args.ik]
-               + (["--motion_command", str(_CWD / args.motion_command)]
+               + (["--motion_command", str(_CWD / args.motion_command), "--stamped"]
                   if args.motion_command else [])
                + (["--stream", str(args.ik_render)] if args.ik_render else [])
                + (["--mlp"] if args.mlp else [])
@@ -198,12 +201,17 @@ def main():
                        else np.zeros((14, 3, 3), np.float32))
                 payload = (t14.astype("<f4").tobytes() + conf.tobytes()
                            + rot.astype("<f4").tobytes())
+                # video time, not wall time: perception runs slower than the footage was
+                # shot, so the wall clock would stretch the motion the reference records
+                stamp = np.float32(src / fps)
                 if mlp is not None:
                     tm = time.time()
                     with torch.no_grad():
                         bp = pred["body_params_incam"]["body_pose"][-1].reshape(-1).float().cpu()
                         payload += mlp(bp).tobytes()
                     prof["mlp"].append(time.time() - tm)
+                if args.motion_command:
+                    payload += stamp.tobytes()
                 if args.ik_async:
                     ik_dropped += not ik.submit(payload)
                     if ik.latest is not None:
@@ -229,7 +237,10 @@ def main():
 
         torch.cuda.synchronize()
         prof["rest"].append(time.time() - ts)
-        t += time.time() - t0
+        # --dense: advance by one source frame instead of by however long the frame took.
+        # Dropping frames is the point when measuring live delay; it is the opposite of
+        # what a reference clip wants, where every frame the camera caught should be used.
+        t += (1.0 / fps) if args.dense else (time.time() - t0)
         shots.append((t, src, draw))
         if chunk_ms is not None:
             robot_shots.append((t, newest_src, chunk_ms))
