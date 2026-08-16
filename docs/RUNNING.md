@@ -318,6 +318,18 @@ docker exec cyclo_lab_shape14_eval bash -lc 'cd /workspace/cyclo_lab_private && 
 ### 카메라에서 바로 (전체 경로)
 
 ```bash
+./run_live.sh                  # 로컬 창(:1). 이게 기본
+./run_live.sh --stream 8080    # 브라우저로 볼 때
+```
+
+Isaac을 띄우고 **UDP 포트가 리슨될 때까지 기다린 뒤** 카메라를 앞으로 내보낸다.
+고정 sleep이 아니라 포트를 보는 이유는, 짧으면 프레임이 통째로 버려지기 때문이다
+(초기 실행에서 434프레임을 그렇게 날렸다). 실측 준비시간 26초. 종료 시 Isaac도 함께
+내린다 — `q`든 Ctrl-C든 실패든.
+
+수동으로 나눠 돌리려면:
+
+```bash
 # 수신부는 위와 동일하게 먼저 띄운다
 GEM-X/.venv/bin/python demo_webcam.py --flip --unmirror --robot k1 \
     --mlp models/k1_retarget.pt --smooth 2.0 --ref_stream 127.0.0.1:9411 \
