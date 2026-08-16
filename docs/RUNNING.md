@@ -269,6 +269,9 @@ make_offsets.py ──► IK용 상수 오프셋
 | `mjpeg.py` | 브라우저 스트리밍과 Calibrate 버튼 |
 | `motion_command.py` | 50 Hz 정책 참조 생성 |
 | `trim_clip.py` | 촬영 앞뒤 정지 구간 잘라내기 (`--show`로 속도 프로파일) |
+| `replay_soma.py` | 저장된 원본을 워커에 다시 흘려보내 리타게팅 재실험 (재촬영 불필요) |
+| `ref_stream.py` | 참조 프레임을 UDP로 발행. `--replay`로 카메라 없이 수신부 시험 |
+| `live_play.py` | 컨테이너에 올려 Isaac을 스트림으로 구동 (파일 대신 실시간) |
 | `make_labels.py` / `make_synth.py` / `distill.py` / `make_offsets.py` | 학습 파이프라인 |
 | `replay_delay.py` | 지연·프레임간격 측정 |
 | `test_apose.py` / `test_calibrate.py` | 회귀 검사 |
@@ -277,3 +280,40 @@ make_offsets.py ──► IK용 상수 오프셋
 | `data/` | 데이터셋 (README 참조) |
 | `models/` | 학습된 학생 체크포인트 |
 | `fixtures/` | 관절 오프셋, rest 자세 |
+
+
+---
+
+## 9. 실시간 심 데모 (Isaac)
+
+파일 대신 스트림으로 정책을 구동한다. 정책이 읽는 건 전부
+`reference.<배열>[frame_ids]`라서, 씨앗 클립으로 env를 만든 뒤 슬롯 하나를 매 프레임
+덮어쓰고 `frame_ids`를 거기 고정하면 된다 — shape14 코드는 건드리지 않는다.
+
+```bash
+# 1) 수신부 (컨테이너). 기동에 60~90초 걸리므로 "viewport on"을 기다릴 것
+docker cp live_play.py cyclo_lab_shape14_eval:/tools/
+docker cp mjpeg.py    cyclo_lab_shape14_eval:/tools/
+docker exec cyclo_lab_shape14_eval bash -lc 'cd /workspace/cyclo_lab_private && \
+  ./third_party/IsaacLab/_isaac_sim/python.sh /tools/live_play.py \
+    --checkpoint <ckpt.pt> --seed_clip /motions/take5b/take5b.npz --stream 8100'
+
+# 2) 발행부 (호스트). 컨테이너가 host 네트워크라 localhost로 통한다
+.venv-ik/bin/python ref_stream.py --replay outputs/clips/take5b/take5b.npz
+```
+
+화면은 `http://<이 머신 IP>:8100`.
+
+측정값 (RTX 5090, 다른 컨테이너와 GPU 공유):
+
+| 항목 | 값 |
+|---|---|
+| 루프 속도 | 49 Hz (정책 50 Hz) |
+| 스트림 반영률 | 434 중 347 프레임 (80%) |
+| 종료/낙상 | 0 |
+
+`--render_every 3`이 기본이다. 매 스텝 렌더링하면 27 Hz로 떨어지고, 증상은 **느린
+영상이 아니라 참조 프레임이 건너뛰어지는 것**으로 나타난다.
+
+아직 남은 것: 발행부가 카메라에 직접 물려 있지 않다. `ref_stream.Publisher`를
+`ik_server`의 `motion_command` 경로에 연결하면 카메라→심이 끊김 없이 이어진다.

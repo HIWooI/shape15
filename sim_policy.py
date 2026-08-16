@@ -92,7 +92,7 @@ class Student:
         return self.adapter.decode_action(raw, canonical=False)
 
 
-def run(clip_npz, robot="k1", video=None, seconds=None, asset=ASSET):
+def run(clip_npz, robot="k1", video=None, seconds=None, asset=ASSET, openloop=False):
     ref = np.load(clip_npz, allow_pickle=True)
     ref_names = [str(n) for n in ref["joint_names"]]
     ref_q, ref_dq = np.asarray(ref["joint_pos"]), np.asarray(ref["joint_vel"])
@@ -153,7 +153,10 @@ def run(clip_npz, robot="k1", video=None, seconds=None, asset=ASSET):
             "joint_vel_rel": data.qvel[vadr].copy(),
             "last_action": pol.last_action,
         })
-        data.ctrl[:] = target      # position servos carry the PD, as sim2real specifies
+        # --openloop drives the reference straight into the servos, with no policy in the
+        # path. It separates "the scene and the gains are wrong" from "what the policy is
+        # being shown is wrong" — the two failures look identical from the outside.
+        data.ctrl[:] = rq if openloop else target
         for _ in range(n_sub):
             mujoco.mj_step(model, data)
 
@@ -185,8 +188,10 @@ def main():
     p.add_argument("--video")
     p.add_argument("--seconds", type=float)
     p.add_argument("--asset", default=str(ASSET))
+    p.add_argument("--openloop", action="store_true",
+                   help="skip the policy and servo straight to the reference")
     a = p.parse_args()
-    run(a.clip, a.robot, a.video, a.seconds, Path(a.asset))
+    run(a.clip, a.robot, a.video, a.seconds, Path(a.asset), openloop=a.openloop)
 
 
 if __name__ == "__main__":
