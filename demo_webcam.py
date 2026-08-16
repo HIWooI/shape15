@@ -581,6 +581,93 @@ class View3D:
         self.vis.update_renderer()
 
 
+class RawLog:
+    """Keep the inputs of a live take, not just the clip derived from them.
+
+    A capture is the one thing in this pipeline that cannot be recomputed: rerunning a
+    script is free, asking a person to perform the motion again is not. So the RGB the
+    camera saw, the SOMA skeleton the network produced and the joint angles that went
+    downstream are all written out, and any later question about which stage introduced
+    a defect can be answered offline against the same frames.
+
+    Encoding happens on its own thread. The whole project is a delay budget, and an
+    mp4 write on the perception loop would be spent out of it.
+    """
+
+    def __init__(self, out_dir, fps=30.0):
+        import queue
+
+        # the module chdir'd into GEM-X at import, so a relative path would land there
+        self.dir = Path(out_dir) if Path(out_dir).is_absolute() else HERE / out_dir
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.q = queue.Queue(maxsize=120)  # bounded: drop frames rather than stall
+        self.rows = []
+        self.ftimes = []
+        self.dropped = 0
+        self.fps = fps
+        self.stop = False
+        self.thread = threading.Thread(target=self._writer, daemon=True)
+        self.thread.start()
+
+    def _writer(self):
+        # cv2, not imageio: it is already imported, it takes the camera's BGR without a
+        # conversion, and the two venvs here disagree about which imageio backend exists
+        import queue
+
+        w = None
+        try:
+            while True:
+                try:
+                    # a timed get rather than a sentinel: the queue is bounded, so
+                    # pushing one would block forever exactly when it is full, which
+                    # is the state a slow encoder leaves it in at shutdown
+                    f = self.q.get(timeout=0.2)
+                except queue.Empty:
+                    if self.stop:
+                        break
+                    continue
+                if w is None:
+                    h, wd = f.shape[:2]
+                    w = cv2.VideoWriter(str(self.dir / "rgb.mp4"),
+                                        cv2.VideoWriter_fourcc(*"mp4v"), self.fps, (wd, h))
+                w.write(f)
+        finally:
+            if w is not None:
+                w.release()
+
+    def frame(self, bgr):
+        try:
+            self.q.put_nowait(bgr)
+        except Exception:
+            self.dropped += 1
+        else:
+            # the writer fixes a nominal fps at the first frame; these are what the
+            # camera actually delivered, so playback speed stays recoverable
+            self.ftimes.append(time.time())
+
+    def soma(self, t, joints3d, conf, jrot, q=None):
+        self.rows.append((t, joints3d.astype(np.float32), np.abs(conf).astype(np.float32),
+                          jrot.astype(np.float32),
+                          None if q is None else np.asarray(q, np.float32)))
+
+    def close(self):
+        self.stop = True
+        self.thread.join(timeout=60)  # the encoder still has a queue to drain
+        if self.rows:
+            out = {
+                "t": np.array([r[0] for r in self.rows], np.float64),
+                "joints3d": np.stack([r[1] for r in self.rows]),   # SOMA, camera frame
+                "conf": np.stack([r[2] for r in self.rows]),
+                "rgb_t": np.array(self.ftimes, np.float64),  # one per frame in rgb.mp4
+                "jrot": np.stack([r[3] for r in self.rows]),       # world rotations
+            }
+            if self.rows[0][4] is not None:
+                out["target_q"] = np.stack([r[4] for r in self.rows])  # what went downstream
+            np.savez(self.dir / "soma.npz", **out)
+        print(f"[raw] {len(self.rows)} SOMA frames, {self.dropped} rgb frames dropped "
+              f"-> {self.dir}", flush=True)
+
+
 class Camera:
     """Capture thread keeping only the newest frame, so inference never lags behind."""
 
@@ -658,6 +745,10 @@ def main():
                         "tracking state, whether the worker took the frame) and print a "
                         "session summary on exit. The frame gap is the column that "
                         "diagnoses a freeze — throughput does not.")
+    p.add_argument("--save_raw", metavar="DIR",
+                   help="keep the take's raw inputs: rgb.mp4 as the camera saw it, and "
+                        "soma.npz with the 3D skeleton, confidences, joint rotations and "
+                        "the targets sent downstream. A live capture cannot be rerun.")
     p.add_argument("--motion_command", metavar="NPZ",
                    help="capture the retargeted motion as a reference clip. Recording "
                         "starts at Calibrate and runs to exit, so the clip only ever "
@@ -816,11 +907,14 @@ def main():
         logf = open(HERE / args.log, "w", buffering=1)
         logf.write("frame,wall,gap_ms,vitpose_ms,predict_ms,fk_ms,retarget_ms,loop_ms,"
                    "tracked,sent,calib\n")
+    raw = RawLog(args.save_raw) if args.save_raw else None
     t_start = time.time()
     try:
       while not cam.stop:
           frame = cam.read()
           t0 = time.time()
+          if raw is not None:
+              raw.frame(frame)  # before any overlay: this is what the camera saw
           gap_ms = 0.0 if t_prev is None else (t0 - t_prev) * 1000.0
           t_prev = t0
           st = {"vitpose": 0.0, "predict": 0.0, "fk": 0.0, "retarget": 0.0}
@@ -907,16 +1001,20 @@ def main():
                          else np.zeros((14, 3, 3), np.float32))
                   payload = (joints3d[SOMA_IDX].astype("<f4").tobytes()
                              + conf.tobytes() + rot.astype("<f4").tobytes())
+                  target_q = None
                   if mlp is not None:
                       with torch.no_grad():
                           bp = pred["body_params_incam"]["body_pose"][-1].reshape(-1).float().cpu()
                           # kp2d confidences, not `conf` — that copy's sign bit doubles as
                           # the calibration signal and must not reach the network
-                          payload += mlp(bp, kp2d[SOMA_IDX, 2].numpy()).tobytes()
+                          target_q = mlp(bp, kp2d[SOMA_IDX, 2].numpy())
+                          payload += target_q.tobytes()
                   # Retry until a submit lands, then stop. IKLink drops frames when the
                   # worker is behind, so the request can miss; but sending it for a whole
                   # window overshoots the worker's own 15-frame measurement and kicks off a
                   # second calibration as soon as the first one finishes.
+                  if raw is not None:
+                      raw.soma(t0, joints3d[SOMA_IDX], conf, rot, target_q)
                   sent = ik.submit(payload)
                   sent_ok = int(sent)
                   n_drop += (not sent)
@@ -966,6 +1064,8 @@ def main():
         logf.close()
         _log_summary(args.log, log_rows, i, time.time() - t_start, n_calib, n_drop, n_reset)
     cam.stop = True
+    if raw is not None:
+        raw.close()
     if ik is not None:
         ik.close()
     cv2.destroyAllWindows()

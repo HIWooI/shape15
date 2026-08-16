@@ -59,6 +59,7 @@ GEM-X/.venv/bin/python demo_webcam.py --flip --robot k1 --stream 8080 \
 | `--mirror` | 로봇 좌우 반전. 거울 데모 전용, `--mlp`와 배타 |
 | `--frames` | 방향 타겟 켜기. **측정상 더 나빠서 기본 꺼짐** |
 | `--motion_command out.npz` | 50 Hz 정책 참조 저장. **Calibrate 시점부터** 종료까지 |
+| `--save_raw DIR` | 촬영 원본 보존: `rgb.mp4`(오버레이 전 카메라 화면) + `soma.npz`(3D 스켈레톤·신뢰도·관절회전·하류로 보낸 타겟·프레임 타임스탬프). 촬영은 재현이 안 되므로 기본으로 켜고 찍을 것 |
 
 ### 오프라인 도구
 
@@ -267,6 +268,7 @@ make_offsets.py ──► IK용 상수 오프셋
 | `ik_retarget.py` | IK 정의(ik_map, 스케일링, twist 널스페이스, 방향 타겟) |
 | `mjpeg.py` | 브라우저 스트리밍과 Calibrate 버튼 |
 | `motion_command.py` | 50 Hz 정책 참조 생성 |
+| `trim_clip.py` | 촬영 앞뒤 정지 구간 잘라내기 (`--show`로 속도 프로파일) |
 | `make_labels.py` / `make_synth.py` / `distill.py` / `make_offsets.py` | 학습 파이프라인 |
 | `replay_delay.py` | 지연·프레임간격 측정 |
 | `test_apose.py` / `test_calibrate.py` | 회귀 검사 |
