@@ -23,13 +23,19 @@ import argparse
 import numpy as np
 
 
-def write_csv(npz_path, csv_path, header=True):
+def write_csv(npz_path, csv_path, header=True, root=None, q=None):
     d = np.load(npz_path, allow_pickle=True)
-    q = np.asarray(d["joint_pos"], np.float64)
+    # the sim export reshapes the clip (lead-in, ground correction); when it passes its
+    # own arrays the runtime gets the exact trajectory the simulation was checked against
+    q = np.asarray(d["joint_pos"] if q is None else q, np.float64)
     names = [str(n) for n in d["joint_names"]]
     n = len(q)
 
-    if "root" in d.files and len(d["root"]) == n:
+    if root is not None:
+        # the sim export corrects the root for ground contact; the runtime should read
+        # the same trajectory the simulation was checked against, not the raw capture
+        root = np.asarray(root, np.float64)
+    elif "root" in d.files and len(d["root"]) == n:
         root = np.asarray(d["root"], np.float64)  # already x,y,z,qx,qy,qz,qw
     else:
         # older captures dropped the root because the policy's observation never reads a

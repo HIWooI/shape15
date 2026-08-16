@@ -50,7 +50,66 @@ def body_states(robot, joint_pos, root, body_names):
     return model, data, bids
 
 
-def export(npz_in, out_dir, robot="k1", name=None):
+SIM2REAL = ("/home/robotis-ai/Projects/shape14/outputs/student_eval/student_asset/"
+            "params/sim2real.yaml")
+
+
+def _lead_in(q, root, joint_names, seconds, fps, sim2real=SIM2REAL):
+    """Prepend an ease from the policy's default pose into the clip's first frame.
+
+    The robot spawns at `default_position` and the reference is read from frame 0, so
+    a clip that opens anywhere else is a step input on the first control tick. Measured
+    on the first live take: 25.4 deg mean and 80.9 deg max away from the default, where
+    a known-good clip of theirs opens 0.4 deg away. It fell immediately, every env.
+
+    The ease is smoothstep, so joint velocity is zero at both ends and the derived
+    `joint_vel` has no discontinuity to hand the policy. The root is held at the clip's
+    opening pose throughout — only the joints move — and the ground correction that
+    runs after forward kinematics takes care of the height that implies.
+    """
+    import yaml
+
+    cfg = yaml.safe_load(Path(sim2real).read_text())
+    jp = cfg["joint_properties"]
+    missing = [n for n in joint_names if n not in jp]
+    if missing:
+        raise KeyError(f"no default_position for {missing}")
+    home = np.array([jp[n]["default_position"] for n in joint_names], np.float32)
+
+    n = max(1, int(round(seconds * fps)))
+    s = np.linspace(0.0, 1.0, n + 1)[:-1]
+    w = (s * s * (3.0 - 2.0 * s))[:, None]
+    ramp = (1.0 - w) * home + w * q[0]
+    return (np.concatenate([ramp.astype(q.dtype), q]),
+            np.concatenate([np.repeat(root[:1], n, axis=0), root]))
+
+
+def _ground_lift(body_pos, body_names, ref_clip, smooth=25):
+    """Per-frame z offset that stops the feet penetrating the floor.
+
+    The floor correction upstream is applied to the SOMA target points, not to the
+    robot the IK actually produced, so whenever the solved legs are longer than the
+    targets imply the feet go through the ground — measured at 59% of frames on the
+    first live take, down to -0.32 m. A reference no robot can occupy is one the
+    policy cannot track, and it fell 4/4 on exactly this clip.
+
+    Lift only, never push down, so a genuine jump keeps its air time. The sole offset
+    (ankle_roll body origin height with the foot flat) is read from a known-good clip
+    of the same robot rather than guessed from the mesh. The lift is smoothed with a
+    moving average because a hard per-frame clamp turns floor contact into a step, and
+    every velocity in the file is a finite difference of these positions.
+    """
+    feet = [i for i, n in enumerate(body_names) if "ankle_roll" in n]
+    if not feet:
+        raise KeyError("no ankle_roll bodies to stand on")
+    sole = float(np.asarray(np.load(ref_clip, allow_pickle=True)["body_pos_w"])[:, feet, 2].min())
+    lift = np.maximum(0.0, sole - body_pos[:, feet, 2].min(1))
+    k = np.ones(smooth) / smooth
+    return np.convolve(np.pad(lift, smooth // 2, mode="edge"), k, "same")[smooth // 2:
+                                                                         smooth // 2 + len(lift)]
+
+
+def export(npz_in, out_dir, robot="k1", name=None, ground=True, lead=1.0):
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     name = name or out_dir.name
@@ -62,6 +121,10 @@ def export(npz_in, out_dir, robot="k1", name=None):
     n = len(q)
     root = (np.asarray(src["root"], np.float64) if "root" in src.files and len(src["root"]) == n
             else np.tile([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0], (n, 1)))
+
+    if lead > 0:
+        q, root = _lead_in(q, root, joint_names, lead, fps)
+        n = len(q)
 
     body_names = [str(b) for b in np.load(REF_CLIP, allow_pickle=True)["body_names"]]
     model, data, bids = body_states(robot, q, root, body_names)
@@ -87,6 +150,12 @@ def export(npz_in, out_dir, robot="k1", name=None):
         body_pos[i] = data.xpos[bids]
         body_quat[i] = data.xquat[bids][:, [1, 2, 3, 0]]  # MuJoCo wxyz -> file xyzw
 
+    if ground:
+        dz = _ground_lift(body_pos, body_names, REF_CLIP)
+        body_pos[:, :, 2] += dz[:, None]
+        root = root.copy()
+        root[:, 2] += dz
+
     def d_dt(a):
         v = np.diff(a, axis=0) * fps
         return np.concatenate([v, v[-1:]], axis=0).astype(np.float32) if len(v) else np.zeros_like(a)
@@ -106,7 +175,7 @@ def export(npz_in, out_dir, robot="k1", name=None):
         "body_ang_vel_w": _ang_vel(body_quat, fps),
     }
     np.savez(out_dir / f"{name}.npz", **out)
-    write_csv(npz_in, out_dir / f"{name}.csv")  # the runtime path wants the CSV too
+    write_csv(npz_in, out_dir / f"{name}.csv", root=root, q=q)  # the runtime path wants the CSV too
     return out_dir / f"{name}.npz", n, len(body_names)
 
 
@@ -129,8 +198,13 @@ def main():
     p.add_argument("npz", help="a motion_command capture")
     p.add_argument("out_dir", help="clip directory to create, named after the clip")
     p.add_argument("--robot", default="k1", choices=["g1", "k1"])
+    p.add_argument("--lead", type=float, default=1.0, metavar="SEC",
+                   help="ease from the policy default pose into the clip; 0 disables")
+    p.add_argument("--no_ground", action="store_true",
+                   help="skip the ground-contact correction and export the root exactly "
+                        "as the IK produced it")
     a = p.parse_args()
-    path, n, nb = export(a.npz, a.out_dir, a.robot)
+    path, n, nb = export(a.npz, a.out_dir, a.robot, ground=not a.no_ground, lead=a.lead)
     print(f"{n} frames, {nb} bodies -> {path}")
 
 
