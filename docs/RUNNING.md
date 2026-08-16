@@ -315,5 +315,24 @@ docker exec cyclo_lab_shape14_eval bash -lc 'cd /workspace/cyclo_lab_private && 
 `--render_every 3`이 기본이다. 매 스텝 렌더링하면 27 Hz로 떨어지고, 증상은 **느린
 영상이 아니라 참조 프레임이 건너뛰어지는 것**으로 나타난다.
 
-아직 남은 것: 발행부가 카메라에 직접 물려 있지 않다. `ref_stream.Publisher`를
-`ik_server`의 `motion_command` 경로에 연결하면 카메라→심이 끊김 없이 이어진다.
+### 카메라에서 바로 (전체 경로)
+
+```bash
+# 수신부는 위와 동일하게 먼저 띄운다
+GEM-X/.venv/bin/python demo_webcam.py --flip --unmirror --robot k1 \
+    --mlp models/k1_retarget.pt --smooth 2.0 --ref_stream 127.0.0.1:9411 \
+    --save_raw outputs/take6_raw --motion_command outputs/take6_mc.npz
+```
+
+`--ref_stream`은 `motion_command`와 **같은 스텝**을 내보낸다 — 50 Hz 리샘플, one-euro,
+속도 클램프를 거친 뒤다. 라이브 데모와 저장 클립이 같은 신호라, 한쪽에 결함이 있으면
+양쪽에 있다.
+
+발행자는 파일 경로가 `export_npz`에서 하던 두 가지를 **인과적으로** 한다:
+
+- **접지 보정** — 매 프레임 발이 바닥 위에 오도록 루트를 올린다 (one-pole, 올리기만).
+- **진입 램프** — 첫 1초는 정책 기본자세에서 사람 자세로 smoothstep. 로봇이 실제로 서
+  있는 자세에서 출발하므로 첫 스텝이 계단 입력이 되지 않는다.
+- **불량 프레임 차단** — 발이 바닥 아래 12 cm를 넘게 요구하는 프레임은 내보내지 않고
+  직전 것을 유지한다. 인지는 윈도가 찰 때까지 2초쯤 쓰레기를 내놓고(발 −0.27 m,
+  32 m/s) 이건 **라이브에서도 매번** 생긴다. 이 차단 하나로 낙상 6회 → 0회.

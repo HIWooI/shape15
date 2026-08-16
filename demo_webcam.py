@@ -752,6 +752,10 @@ def main():
                         "tracking state, whether the worker took the frame) and print a "
                         "session summary on exit. The frame gap is the column that "
                         "diagnoses a freeze — throughput does not.")
+    p.add_argument("--ref_stream", metavar="HOST:PORT",
+                   help="publish the 50 Hz reference over UDP as it is produced, so a "
+                        "simulator follows the camera live. Works with or without "
+                        "--motion_command; the stream and the file are the same steps.")
     p.add_argument("--unmirror", action="store_true",
                    help="the camera delivers a mirrored image; flip it back before "
                         "anything reads it. Check by finding readable text in the scene: "
@@ -837,7 +841,8 @@ def main():
             + (["--frames"] if args.frames else [])
             + (["--mirror"] if args.mirror else [])
             + (["--mlp"] if (args.mlp or args.kp2d_mlp) else [])
-            + (["--motion_command", args.motion_command] if args.motion_command else []),
+            + (["--motion_command", args.motion_command] if args.motion_command else [])
+            + (["--ref_stream", args.ref_stream] if args.ref_stream else []),
             HERE, ik_ndof,
         )
     kp2d_net = None

@@ -143,6 +143,20 @@ def main():
     mc_path = sys.argv[sys.argv.index("--motion_command") + 1] if "--motion_command" in sys.argv else None
     mc = (MotionCommand(ndof, 50.0, robot.joints.actuated_names,
                     np.asarray(robot.joints.velocity_limits)) if mc_path else None)
+    # --ref_stream HOST:PORT publishes each 50 Hz step as it is produced, so a simulator
+    # can follow the operator instead of a file. It rides on the same resampled, filtered,
+    # velocity-clamped steps the recording writes: the live demo and the saved clip are
+    # then the same signal, and a fault in one is a fault in both.
+    pub = None
+    if "--ref_stream" in sys.argv:
+        import ref_stream
+        host, _, port = sys.argv[sys.argv.index("--ref_stream") + 1].rpartition(":")
+        pub = ref_stream.Publisher(name, list(robot.joints.actuated_names),
+                                   (host or "127.0.0.1", int(port)))
+        print(f"[ref_stream] publishing to {host or '127.0.0.1'}:{port}", file=sys.stderr)
+        if mc is None:
+            mc = MotionCommand(ndof, 50.0, robot.joints.actuated_names,
+                               np.asarray(robot.joints.velocity_limits))
     torso_i = 1  # IK_MAP index of Chest -> the torso link
 
     # Per-joint constant offsets measured against soma-retargeter's own output. SOMA and
@@ -294,8 +308,12 @@ def main():
             # quaternion stored xyzw), so carry the IK's own base transform along
             root = np.concatenate([np.asarray(T.translation()),
                                    np.asarray(T.rotation().wxyz)[[1, 2, 3, 0]]])
-            mc.push(_t.time() if t_frame is None else t_frame,
-                    np.asarray(q_out), R, root.astype(np.float32))
+            emitted = mc.push(_t.time() if t_frame is None else t_frame,
+                              np.asarray(q_out), R, root.astype(np.float32))
+            if pub is not None:
+                for st in emitted:
+                    pub.send(st[1], st[4] if st[4] is not None
+                             else np.array([0, 0, 0, 0, 0, 0, 1], np.float32))
         out = np.concatenate([[(time.time() - t0) * 1000], np.asarray(q_out)]).astype("<f4")
         sys.stdout.buffer.write(out.tobytes())
         sys.stdout.buffer.flush()
@@ -306,7 +324,7 @@ def main():
         for k, v in prof.items():
             if v:
                 print(f"  {k:12s} {np.median(v[3:]) * 1000:6.2f}  (n={len(v)})", file=sys.stderr)
-    if mc is not None:
+    if mc is not None and mc_path:
         n = mc.save(mc_path)
         print(f"[motion_command] wrote {n} steps at {mc.rate:.0f} Hz to {mc_path}",
               file=sys.stderr)

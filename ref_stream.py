@@ -20,8 +20,8 @@ correct response to falling behind, not queueing.
 """
 
 import socket
-import struct
 import time
+from pathlib import Path
 
 import mujoco
 import numpy as np
@@ -35,7 +35,8 @@ DEFAULT_ADDR = ("127.0.0.1", 9411)
 class Publisher:
     """Turns joint angles plus a root pose into the rows the simulator's command reads."""
 
-    def __init__(self, robot="k1", joint_names=None, addr=DEFAULT_ADDR, fps=50.0):
+    def __init__(self, robot="k1", joint_names=None, addr=DEFAULT_ADDR, fps=50.0,
+                 ground=True, lead=1.0, sim2real=None, max_lift=0.12):
         self.model = mujoco.MjModel.from_xml_path(MJCF[robot])
         self.data = mujoco.MjData(self.model)
         self.body_names = [str(b) for b in np.load(REF_CLIP, allow_pickle=True)["body_names"]]
@@ -56,6 +57,28 @@ class Publisher:
         self.seq = 0
         self.prev = None  # (joint_pos, body_pos, body_quat) for the differences
 
+        # The file path gets these from export_npz. A stream has to do them causally, and
+        # without them it publishes exactly the defects that were fixed offline: feet
+        # through the floor, and a first frame that is a step away from where the robot
+        # is standing. Both terminated the live run.
+        self.ground = ground
+        self.feet = [i for i, b in enumerate(self.body_names) if "ankle_roll" in b]
+        self.sole = float(np.asarray(
+            np.load(REF_CLIP, allow_pickle=True)["body_pos_w"])[:, self.feet, 2].min())
+        self.lift = 0.0
+        self.lift_alpha = 0.25  # one-pole: a hard per-frame clamp steps the velocities
+        # How far below the floor a frame may ask the feet to be before it is judged
+        # untrustworthy rather than merely uncorrected. Perception needs a couple of
+        # seconds to fill its window and produces nonsense until it has -- feet 0.27 m
+        # under the floor, bodies at 32 m/s -- and that happens on every fresh start,
+        # including a live one. Holding the last good frame reads as the person pausing.
+        self.max_lift = max_lift
+        self.dropped = 0
+        self.lead_left = self.lead_total = int(round(lead * fps))
+        self.home = None
+        if self.lead_left and self.joint_names:
+            self.home = _home_pose(self.joint_names, sim2real)
+
     def _bind(self, joint_names):
         self.qadr = []
         for jn in joint_names:
@@ -67,7 +90,14 @@ class Publisher:
     def send(self, joint_pos, root):
         """joint_pos in our URDF order; root as x,y,z,qx,qy,qz,qw."""
         q = np.asarray(joint_pos, np.float64)
-        root = np.asarray(root, np.float64)
+        root = np.asarray(root, np.float64).copy()
+        if self.lead_left and self.home is not None:
+            # ease out of the pose the robot is actually standing in, rather than jumping
+            n = self.lead_left
+            u = 1.0 - n / max(self.lead_total, 1)
+            w = u * u * (3.0 - 2.0 * u)
+            q = (1.0 - w) * self.home + w * q
+            self.lead_left -= 1
         if self.free:
             self.data.qpos[0:3] = root[0:3]
             self.data.qpos[3:7] = root[[6, 3, 4, 5]]  # file xyzw -> MuJoCo wxyz
@@ -76,6 +106,14 @@ class Publisher:
         mujoco.mj_forward(self.model, self.data)
         bpos = self.data.xpos[self.bids].copy()
         bquat = self.data.xquat[self.bids][:, [1, 2, 3, 0]].copy()  # wxyz -> xyzw
+        if self.ground:
+            want = max(0.0, self.sole - float(bpos[self.feet, 2].min()))
+            if self.max_lift and want > self.max_lift:
+                self.dropped += 1
+                return 0  # not a pose a robot could hold; keep the last one on the wire
+            self.lift += self.lift_alpha * (want - self.lift)
+            bpos[:, 2] += self.lift
+            root[2] += self.lift
 
         if self.prev is None:
             jvel = np.zeros_like(q)
@@ -94,6 +132,16 @@ class Publisher:
         self.sock.sendto(payload.tobytes(), self.addr)
         self.seq += 1
         return len(payload)
+
+
+def _home_pose(joint_names, sim2real=None):
+    """The policy's default_position, in our joint order — where the robot starts."""
+    import yaml
+
+    path = sim2real or ("/home/robotis-ai/Projects/shape14/outputs/student_eval/"
+                        "student_asset/params/sim2real.yaml")
+    jp = yaml.safe_load(Path(path).read_text())["joint_properties"]
+    return np.array([jp[n]["default_position"] for n in joint_names], np.float64)
 
 
 def _ang_vel(q0_xyzw, q1_xyzw, dt):
@@ -118,7 +166,8 @@ def replay(clip_npz, addr=DEFAULT_ADDR, robot="k1", realtime=True):
     fps = float(np.asarray(d["fps"]).ravel()[0]) if "fps" in d.files else 50.0
     bp, bq = np.asarray(d["body_pos_w"]), np.asarray(d["body_quat_w"])
 
-    pub = Publisher(robot, names, addr, fps)
+    # a saved clip already went through export_npz, which applied both
+    pub = Publisher(robot, names, addr, fps, ground=False, lead=0.0)
     dt = 1.0 / fps
     t0 = time.time()
     for i in range(len(q)):

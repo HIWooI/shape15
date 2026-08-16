@@ -15,8 +15,8 @@ the operator pressed Calibrate, and the worker needs the signal to measure bone 
 """
 
 import argparse
-import struct
 import subprocess
+import time
 import sys
 from pathlib import Path
 
@@ -26,7 +26,8 @@ HERE = Path(__file__).parent.resolve()
 NDOF = {"g1": 29, "k1": 23}
 
 
-def replay(soma_npz, out_npz, robot="k1", extra=(), python=None, start=0.0, end=None):
+def replay(soma_npz, out_npz, robot="k1", extra=(), python=None, start=0.0, end=None,
+           realtime=False):
     d = np.load(soma_npz, allow_pickle=True)
     j3d = np.asarray(d["joints3d"], "<f4")
     conf = np.asarray(d["conf"], "<f4")
@@ -58,6 +59,7 @@ def replay(soma_npz, out_npz, robot="k1", extra=(), python=None, start=0.0, end=
     proc.stdout.read(4)  # ready marker
 
     n_out = (1 + NDOF[robot]) * 4
+    t_start = time.time()
     for i in range(n):
         c = conf[i].copy()
         if i == 0:
@@ -66,6 +68,10 @@ def replay(soma_npz, out_npz, robot="k1", extra=(), python=None, start=0.0, end=
         if tq is not None:
             payload += tq[i].tobytes()
         payload += rel[i].tobytes()
+        if realtime and i:
+            slack = float(rel[i] - rel[0]) - (time.time() - t_start)
+            if slack > 0:
+                time.sleep(slack)
         proc.stdin.write(payload)
         proc.stdin.flush()
         # Read every reply rather than dropping like IKLink does: this is offline, so
@@ -88,9 +94,16 @@ def main():
     p.add_argument("--start", type=float, default=0.0, metavar="SEC",
                    help="replay from here; calibration is injected on this frame")
     p.add_argument("--end", type=float, metavar="SEC")
+    p.add_argument("--ref_stream", metavar="HOST:PORT",
+                   help="also publish the steps live, at replay speed")
+    p.add_argument("--realtime", action="store_true",
+                   help="pace the replay to the take's own timing (needed with --ref_stream)")
     a = p.parse_args()
-    extra = ([("--free_root")] if a.free_root else []) + (["--frames"] if a.frames else [])
-    n, secs = replay(a.soma, a.out, a.robot, extra, start=a.start, end=a.end)
+    extra = (["--free_root"] if a.free_root else []) + (["--frames"] if a.frames else [])
+    if a.ref_stream:
+        extra += ["--ref_stream", a.ref_stream]
+    n, secs = replay(a.soma, a.out, a.robot, extra, start=a.start, end=a.end,
+                     realtime=a.realtime or bool(a.ref_stream))
     print(f"{n} frames ({secs:.1f}s of take) -> {a.out}")
 
 
