@@ -185,6 +185,8 @@ def main():
             print("[calib] re-measuring scales and floor", file=sys.stderr)
             # the current scales keep driving the robot until the new ones replace them
             calib, recalibrating = [], True
+            if mc is not None:
+                mc.reset()  # the clip starts at Calibrate, not at process start
         jrot = raw[56:182].reshape(14, 3, 3).copy()  # SOMA joint world rotations, camera frame
         pts = raw[:42].reshape(1, 14, 3).copy()
         if mirror:
@@ -262,7 +264,11 @@ def main():
             # the policy wants the reference torso orientation, not a root position
             R = np.asarray((T @ jaxlie.SE3(
                 robot.forward_kinematics(q)[link_idx[torso_i]])).rotation().as_matrix())
-            mc.push(_t.time(), np.asarray(q_out), R)
+            # the CSV the policy runtime reads wants a root pose too (7 columns,
+            # quaternion stored xyzw), so carry the IK's own base transform along
+            root = np.concatenate([np.asarray(T.translation()),
+                                   np.asarray(T.rotation().wxyz)[[1, 2, 3, 0]]])
+            mc.push(_t.time(), np.asarray(q_out), R, root.astype(np.float32))
         out = np.concatenate([[(time.time() - t0) * 1000], np.asarray(q_out)]).astype("<f4")
         sys.stdout.buffer.write(out.tobytes())
         sys.stdout.buffer.flush()

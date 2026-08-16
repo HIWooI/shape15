@@ -58,7 +58,7 @@ GEM-X/.venv/bin/python demo_webcam.py --flip --robot k1 --stream 8080 \
 | `--flip` | 화면 좌우 반전(거울처럼 보이게) |
 | `--mirror` | 로봇 좌우 반전. 거울 데모 전용, `--mlp`와 배타 |
 | `--frames` | 방향 타겟 켜기. **측정상 더 나빠서 기본 꺼짐** |
-| `--motion_command out.npz` | (워커 플래그) 50 Hz 정책 참조 저장 |
+| `--motion_command out.npz` | 50 Hz 정책 참조 저장. **Calibrate 시점부터** 종료까지 |
 
 ### 오프라인 도구
 
@@ -190,7 +190,8 @@ JAX/pyroki가 필요하고 버전이 충돌한다. 나눈 결과 부수 이득�
 5. **MuJoCo 표시** — 물리 없이 `qpos`만 설정하고 `mj_forward`. 스트리밍이면 EGL 오프스크린.
 6. **정책 참조** (`--motion_command`) — 50 Hz로 리샘플, one-euro 필터, URDF 속도한계
    클램프 후 차분. 출력은 관절위치 23 + 속도 23 + torso 방향 6 = shape14 정책의 관측과
-   정확히 일치한다.
+   정확히 일치한다. 녹화는 Calibrate 신호(`conf[0]` 부호비트)에서 버퍼를 비우고 다시
+   시작한다 — 그 이전 프레임은 이전 사람의 뼈 스케일로 측정된 것이라 참조가 못 된다.
 
 ---
 

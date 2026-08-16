@@ -94,13 +94,19 @@ def main():
 
     mlp = None
     if args.mlp:
+        # mirror demo_webcam's loader: the deployed model is a parts checkpoint, which
+        # carries no top-level state/mu/sd because each expert normalises its own input
         ck = torch.load(str(_CWD / args.mlp), map_location="cpu", weights_only=False)
         mlp_net = D.build_student(ck, len(ck["names"]))
-        mlp_net.load_state_dict(ck["state"])
+        if "state" in ck:
+            mlp_net.load_state_dict(D._remap_block_keys(ck["state"]))
         mlp_net.eval()
-        mmu = torch.tensor(np.asarray(ck["mu"]), dtype=torch.float32)
-        msd = torch.tensor(np.asarray(ck["sd"]), dtype=torch.float32)
-        mlp = lambda bp: mlp_net((bp - mmu) / msd).numpy().astype("<f4")
+        if str(ck.get("arch", "plain")) == "parts":
+            mlp = lambda bp: mlp_net(bp).numpy().astype("<f4")
+        else:
+            mmu = torch.tensor(np.asarray(ck["mu"]), dtype=torch.float32)
+            msd = torch.tensor(np.asarray(ck["sd"]), dtype=torch.float32)
+            mlp = lambda bp: mlp_net((bp - mmu) / msd).numpy().astype("<f4")
 
     ik, ik_ndof, ik_dropped = None, 0, 0
     if args.ik:

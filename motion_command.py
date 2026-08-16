@@ -56,6 +56,12 @@ class MotionCommand:
     last value, so the velocity stays continuous.
     """
 
+    # What the downstream policy was trained on, not what the motors can do. shape14
+    # excluded a clip at 114 rad/s and its safe recorded clip ran 4.6-12.6 rad/s, so a
+    # reference above that band is outside the distribution the policy ever saw. The URDF
+    # limits (11.5-20.9) describe the actuators and are the wrong ceiling for a reference.
+    POLICY_MAX_VEL = 12.6
+
     def __init__(self, ndof, rate=50.0, joint_names=None, vel_limits=None):
         self.dt = 1.0 / rate
         self.rate = rate
@@ -63,8 +69,9 @@ class MotionCommand:
         # A reference the robot cannot physically follow is worse than a late one: an IK
         # solution that flips branch between frames differences into hundreds of rad/s.
         # Clamp the step to what the joint can actually do (URDF limits when we have them).
-        self.max_step = (np.asarray(vel_limits, np.float64) if vel_limits is not None
-                         else np.full(ndof, 10.0)) * self.dt
+        lim = (np.asarray(vel_limits, np.float64) if vel_limits is not None
+               else np.full(ndof, 10.0))
+        self.max_step = np.minimum(lim, self.POLICY_MAX_VEL) * self.dt
         self.t0 = None
         self.filter = OneEuro(ndof)
         self.prev = None  # (t, q) most recent push
@@ -73,33 +80,45 @@ class MotionCommand:
         self.q_prev_out = None
         self.steps = []  # (t, q, qdot, torso_ori6)
 
+    def reset(self):
+        """Throw away what has been recorded and start over from the next push.
+
+        Bound to the Calibrate button: everything before it was captured with the
+        previous person's bone scales, so it is not a reference for anyone.
+        """
+        self.filter = OneEuro(len(self.max_step))
+        self.prev = self.last = self.t_next = self.q_prev_out = None
+        self.steps = []
+
     @staticmethod
     def ori6(R):
         """First two columns of a rotation matrix, as the policy's 6D convention."""
         return np.asarray(R, np.float32)[:, :2].T.reshape(-1)
 
-    def push(self, t, q, torso_R):
+    def push(self, t, q, torso_R, root=None):
         if self.t0 is None:
             self.t0 = t
         t = t - self.t0  # relative: absolute unix time loses all resolution in float32
         q = np.asarray(q, np.float64)
         if self.prev is None:
-            self.prev, self.t_next = (t, q, torso_R), t
+            self.prev, self.t_next = (t, q, torso_R, root), t
             return []
-        self.last, self.prev = self.prev, (t, q, torso_R)
+        self.last, self.prev = self.prev, (t, q, torso_R, root)
         out = []
         while self.t_next <= self.prev[0]:  # emit every policy step we have data for
-            t0, q0, R0 = self.last
-            t1, q1, R1 = self.prev
+            t0, q0, R0, root0 = self.last
+            t1, q1, R1, root1 = self.prev
             u = 0.0 if t1 <= t0 else (self.t_next - t0) / (t1 - t0)
             qi = self.filter((1 - u) * q0 + u * q1, self.dt)
             if self.q_prev_out is not None:
                 step_lim = np.clip(qi - self.q_prev_out, -self.max_step, self.max_step)
                 qi = self.q_prev_out + step_lim
             Ri = R0 if u < 0.5 else R1  # orientation: nearest, not interpolated
+            rooti = root0 if u < 0.5 else root1
             qdot = np.zeros_like(qi) if self.q_prev_out is None else (qi - self.q_prev_out) / self.dt
             self.q_prev_out = qi
-            step = (self.t_next, qi.astype(np.float32), qdot.astype(np.float32), self.ori6(Ri))
+            step = (self.t_next, qi.astype(np.float32), qdot.astype(np.float32),
+                    self.ori6(Ri), rooti)
             self.steps.append(step)
             out.append(step)
             self.t_next += self.dt
@@ -113,6 +132,9 @@ class MotionCommand:
             joint_pos=np.stack([s[1] for s in self.steps]) if self.steps else np.zeros((0,)),
             joint_vel=np.stack([s[2] for s in self.steps]) if self.steps else np.zeros((0,)),
             torso_ori6=np.stack([s[3] for s in self.steps]) if self.steps else np.zeros((0,)),
+            root=np.stack([np.asarray(s[4], np.float32) if s[4] is not None
+                           else np.array([0, 0, 0, 0, 0, 0, 1], np.float32)
+                           for s in self.steps]) if self.steps else np.zeros((0,)),
             joint_names=np.array(self.joint_names or [], dtype=object),
             rate=self.rate,
         )
@@ -133,7 +155,8 @@ def _self_check():
     for i in range(20):
         jump.push(i / 15.0, np.array([0.0 if i < 10 else 3.0, 0.0, 0.0]), np.eye(3))
     vj = np.abs(np.stack([s[2] for s in jump.steps])).max()
-    assert vj <= 11.5 + 1e-3, f"branch flip leaked {vj:.1f} rad/s past the limit"
+    cap = min(11.5, MotionCommand.POLICY_MAX_VEL)
+    assert vj <= cap + 1e-3, f"branch flip leaked {vj:.1f} rad/s past {cap}"
 
     noisy = MotionCommand(3, rate=50.0)
     rng = np.random.RandomState(0)
@@ -144,6 +167,7 @@ def _self_check():
     assert vn < 5.0, f"jitter amplified into {vn:.1f} rad/s"
 
     assert MotionCommand.ori6(np.eye(3)).tolist() == [1, 0, 0, 0, 1, 0]
+    assert len(mc.steps[0]) == 5 and mc.steps[0][4] is None  # root is optional
 
     # demo_webcam's --smooth passes the *measured* dt rather than a nominal frame period,
     # because the camera rate moves (16-30 fps depending on what else has the GPU) and a

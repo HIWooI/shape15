@@ -658,6 +658,10 @@ def main():
                         "tracking state, whether the worker took the frame) and print a "
                         "session summary on exit. The frame gap is the column that "
                         "diagnoses a freeze — throughput does not.")
+    p.add_argument("--motion_command", metavar="NPZ",
+                   help="capture the retargeted motion as a reference clip. Recording "
+                        "starts at Calibrate and runs to exit, so the clip only ever "
+                        "contains frames measured against the current operator.")
     p.add_argument("--kp2d_mlp", metavar="PT",
                    help="the stage-cut student: VitPose 2D window -> joint angles + the "
                         "14 targets, skipping the GEM denoiser and SOMA FK entirely. "
@@ -730,7 +734,8 @@ def main():
             + (["--stream", str(args.stream + 1)] if args.stream else ["--view"])
             + (["--frames"] if args.frames else [])
             + (["--mirror"] if args.mirror else [])
-            + (["--mlp"] if (args.mlp or args.kp2d_mlp) else []),
+            + (["--mlp"] if (args.mlp or args.kp2d_mlp) else [])
+            + (["--motion_command", args.motion_command] if args.motion_command else []),
             HERE, ik_ndof,
         )
     kp2d_net = None
